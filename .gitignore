@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Data lake e ingesta — regenerable, no versionar
+data/
+*.db-journal
+manifest.sqlite
+cache.sqlite
+
+# Logs
+logs/
+*.log
+
+# Secretos
+.env
+
+# Scratch de ingesta
+*.zip

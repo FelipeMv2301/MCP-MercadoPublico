@@ -1,0 +1,304 @@
+"""Pipeline completo de ingesta: descarga -> extracción -> transform -> Parquet -> manifest.
+
+HU-2.4 (transformar_y_escribir) + HU-2.5 (ingerir_periodo, el orquestador).
+Van juntas porque una sin la otra queda a medio construir: transformar sin
+persistir el resultado en el manifest no es una ingesta utilizable.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
+import duckdb
+
+from mcp_mercadopublico.lake.columnas import (
+    COLUMNA_CODIGO_PRODUCTO_ONU,
+    COLUMNA_MONEDA,
+    COLUMNA_RUBRO_N1,
+    COLUMNAS_NUMERICAS,
+    a_snake_case,
+    renombrar_columnas,
+)
+from mcp_mercadopublico.lake.descarga import Dataset, descargar_periodo
+from mcp_mercadopublico.lake.extraccion import extraer_csv_utf8
+from mcp_mercadopublico.lake.manifest import obtener_periodo, registrar_periodo
+from mcp_mercadopublico.logging_setup import log_evento_etl
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ResultadoIngesta:
+    dataset: str
+    periodo: str
+    estado: str  # "ingerido" | "sin_cambios" | "no_publicado"
+    filas_leidas: int = 0
+    filas_escritas: int = 0
+    filas_descartadas: int = 0
+    ruta_parquet: Path | None = None
+
+
+# --------------------------------------------------------------------------
+# Construcción de la proyección SQL (renombre + tipado + nulos) — HU-2.3/2.4
+# --------------------------------------------------------------------------
+
+
+def _escapar_identificador(nombre: str) -> str:
+    return '"' + nombre.replace('"', '""') + '"'
+
+
+def _expresion_columna(original: str, snake: str, numericas: frozenset[str]) -> str:
+    ident = _escapar_identificador(original)
+    if original in numericas:
+        # P2 (decimal con coma) + P4 (NA/vacío nulo). Las columnas numéricas
+        # no traen el sentinela de fecha, así que no hace falta ese NULLIF.
+        valor = f"NULLIF(NULLIF(REPLACE({ident}, ',', '.'), 'NA'), '')"
+        expr = f"TRY_CAST({valor} AS DOUBLE)"
+    else:
+        # P4/P5/P6: "NA", "" y el sentinela 1900-01-01 -> NULL, incluso en
+        # columnas de texto libre (DireccionVisita/DireccionEntrega quedan
+        # contaminadas con la fecha sentinela por un bug del dataset).
+        expr = ident
+        for nulo in ("'NA'", "''", "'1900-01-01'"):
+            expr = f"NULLIF({expr}, {nulo})"
+    return f"{expr} AS {_escapar_identificador(snake)}"
+
+
+def _construir_proyeccion(columnas_originales: list[str], mapa: dict[str, str], dataset: str) -> str:
+    numericas = COLUMNAS_NUMERICAS[dataset]
+    piezas = [_expresion_columna(c, mapa[c], numericas) for c in columnas_originales]
+
+    # P15: precioNeto/MontoUnitarioOferta/MontoTotal no siempre son CLP.
+    # es_clp deja explícito el filtro que toda tool de precios debe aplicar.
+    moneda_original = COLUMNA_MONEDA[dataset]
+    moneda_snake = mapa[moneda_original]
+    piezas.append(f"({_escapar_identificador(moneda_snake)} = 'CLP') AS es_clp")
+
+    return ", ".join(piezas)
+
+
+# --------------------------------------------------------------------------
+# Filtro: por RubroN1 (OC/LIC) o por whitelist de código ONU (COT) — HU-2.4
+# --------------------------------------------------------------------------
+
+
+def whitelist_codigos_onu_vigente(con: duckdb.DuckDBPyConnection, data_dir: Path) -> list[str]:
+    """Códigos ONU/UNSPSC presentes en el lake de OC+LIC ya ingerido.
+
+    COT no tiene columna de rubro (ver columnas.py) — se filtra por esta
+    whitelist en vez de por RubroN1. Por eso el orden de ingesta importa:
+    ingerir al menos un periodo de OC o LIC antes de ingerir COT, o esto
+    vuelve vacío y COT no retiene ninguna fila (se advierte, no falla en
+    silencio — ver _clausula_filtro).
+    """
+    piezas = []
+    for ds in ("oc", "lic"):
+        directorio = data_dir / ds
+        if not directorio.exists() or not any(directorio.glob("**/*.parquet")):
+            continue
+        snake = a_snake_case(COLUMNA_CODIGO_PRODUCTO_ONU[ds])
+        ident = _escapar_identificador(snake)
+        patron = (directorio / "**" / "*.parquet").as_posix()
+        piezas.append(
+            f"SELECT DISTINCT {ident} AS c FROM read_parquet('{patron}', union_by_name=true) "
+            f"WHERE {ident} IS NOT NULL"
+        )
+    if not piezas:
+        return []
+    filas = con.execute(" UNION ".join(piezas)).fetchall()
+    return [f[0] for f in filas]
+
+
+def _clausula_filtro(
+    dataset: str,
+    mapa: dict[str, str],
+    rubros_permitidos: list[str] | None,
+    whitelist_onu: list[str] | None,
+) -> tuple[str, list]:
+    rubro_original = COLUMNA_RUBRO_N1[dataset]
+
+    if rubro_original is not None:
+        if not rubros_permitidos:
+            raise ValueError(
+                f"dataset {dataset!r} tiene columna de rubro pero no se pasó rubros_permitidos"
+            )
+        # Comparación case-insensitive: verificado que RubroN1 (OC) viene en
+        # Title Case ("Equipamiento para laboratorios") pero Rubro1 (LIC)
+        # viene en MAYÚSCULAS ("EQUIPAMIENTO PARA LABORATORIOS") para el
+        # mismo rubro — un match exacto habría descartado LIC completo.
+        ident = _escapar_identificador(mapa[rubro_original])
+        rubros_upper = [r.upper() for r in rubros_permitidos]
+        return f"UPPER({ident}) = ANY($1)", [rubros_upper]
+
+    if whitelist_onu is None:
+        raise ValueError(
+            "dataset 'cot' no tiene columna de rubro — requiere whitelist_onu "
+            "(ver whitelist_codigos_onu_vigente, derivada de OC+LIC ya ingeridos)"
+        )
+    if not whitelist_onu:
+        logger.warning(
+            "whitelist_onu_vacia",
+            extra={
+                "extra_fields": {
+                    "dataset": dataset,
+                    "detalle": "COT no retendrá ninguna fila; ingerir un periodo de OC o LIC primero",
+                }
+            },
+        )
+    ident = _escapar_identificador(mapa[COLUMNA_CODIGO_PRODUCTO_ONU[dataset]])
+    return f"{ident} = ANY($1)", [whitelist_onu]
+
+
+# --------------------------------------------------------------------------
+# Transform + escritura Parquet — HU-2.4
+# --------------------------------------------------------------------------
+
+
+def transformar_y_escribir(
+    con: duckdb.DuckDBPyConnection,
+    dataset: str,
+    rutas_csv: list[Path],
+    anio: int,
+    mes: int,
+    data_dir: Path,
+    *,
+    rubros_permitidos: list[str] | None = None,
+    whitelist_onu: list[str] | None = None,
+) -> tuple[int, int, Path]:
+    """Lee los CSV ya extraídos/transcodificados a UTF-8, renombra y tipa
+    columnas, filtra y escribe una partición Parquet.
+
+    Devuelve (filas_leidas, filas_escritas, ruta_parquet). La diferencia
+    entre ambas es lo descartado por el filtro de rubro/whitelist — nunca
+    se trunca en silencio, el llamador debe loggear ese delta.
+    """
+    origen = str(rutas_csv[0]) if len(rutas_csv) == 1 else [str(r) for r in rutas_csv]
+    rel_origen = con.read_csv(
+        origen,
+        delimiter=";",
+        quotechar='"',
+        encoding="UTF-8",
+        header=True,
+        all_varchar=True,
+        sample_size=200_000,
+    )
+    filas_leidas = con.execute("SELECT COUNT(*) FROM rel_origen").fetchone()[0]
+
+    columnas_originales = rel_origen.columns
+    mapa = renombrar_columnas(columnas_originales)
+    proyeccion = _construir_proyeccion(columnas_originales, mapa, dataset)
+    where_sql, params = _clausula_filtro(dataset, mapa, rubros_permitidos, whitelist_onu)
+
+    rel_filtrada = con.sql(
+        f"SELECT {proyeccion} FROM rel_origen WHERE {where_sql}", params=params
+    )
+
+    destino_dir = data_dir / dataset / f"anio={anio}" / f"mes={mes}"
+    destino_dir.mkdir(parents=True, exist_ok=True)
+    ruta_parquet = destino_dir / "part.parquet"
+    rel_filtrada.write_parquet(str(ruta_parquet), compression="zstd")
+
+    filas_escritas = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{ruta_parquet.as_posix()}')"
+    ).fetchone()[0]
+
+    return filas_leidas, filas_escritas, ruta_parquet
+
+
+# --------------------------------------------------------------------------
+# Orquestador completo — HU-2.5
+# --------------------------------------------------------------------------
+
+
+def ingerir_periodo(
+    dataset: Dataset,
+    anio: int,
+    mes: int,
+    *,
+    data_dir: Path,
+    manifest_path: Path,
+    scratch_dir: Path,
+    rubros_permitidos: list[str] | None = None,
+) -> ResultadoIngesta:
+    """Pipeline de un periodo: manifest -> descarga condicional -> extracción
+    -> transform -> Parquet -> actualizar manifest -> limpiar scratch.
+
+    Idempotente: reingerir el mismo periodo reemplaza su partición (mismo
+    nombre de archivo) y su fila en el manifest — seguro de volver a llamar.
+    El scratch se limpia siempre (éxito o excepción), nunca deja el ZIP ni
+    los CSV intermedios ocupando disco entre ingestas.
+    """
+    periodo = f"{anio}-{mes}"
+    registro_previo = obtener_periodo(manifest_path, dataset, periodo)
+    etag_previo = registro_previo.etag if registro_previo else None
+
+    scratch_periodo = scratch_dir / f"{dataset}_{anio}_{mes}"
+
+    try:
+        resultado_descarga = descargar_periodo(
+            dataset, anio, mes, scratch_periodo, etag_previo=etag_previo
+        )
+
+        if resultado_descarga.estado == "no_publicado":
+            return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="no_publicado")
+
+        if resultado_descarga.estado == "sin_cambios":
+            return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="sin_cambios")
+
+        con = duckdb.connect()
+        try:
+            rutas_csv = extraer_csv_utf8(resultado_descarga.ruta, scratch_periodo / "extraido")
+
+            whitelist_onu = (
+                whitelist_codigos_onu_vigente(con, data_dir) if dataset == "cot" else None
+            )
+
+            filas_leidas, filas_escritas, ruta_parquet = transformar_y_escribir(
+                con,
+                dataset,
+                rutas_csv,
+                anio,
+                mes,
+                data_dir,
+                rubros_permitidos=rubros_permitidos,
+                whitelist_onu=whitelist_onu,
+            )
+        finally:
+            con.close()
+    finally:
+        shutil.rmtree(scratch_periodo, ignore_errors=True)
+
+    filas_descartadas = filas_leidas - filas_escritas
+    registrar_periodo(
+        manifest_path,
+        dataset=dataset,
+        periodo=periodo,
+        etag=resultado_descarga.etag,
+        last_modified=resultado_descarga.last_modified,
+        filas_leidas=filas_leidas,
+        filas_escritas=filas_escritas,
+        filas_descartadas=filas_descartadas,
+        estado="ingerido",
+    )
+    log_evento_etl(
+        logger,
+        dataset=dataset,
+        periodo=periodo,
+        filas_leidas=filas_leidas,
+        filas_escritas=filas_escritas,
+        filas_descartadas=filas_descartadas,
+        motivo_descarte="fuera de rubros/whitelist configurados",
+    )
+
+    return ResultadoIngesta(
+        dataset=dataset,
+        periodo=periodo,
+        estado="ingerido",
+        filas_leidas=filas_leidas,
+        filas_escritas=filas_escritas,
+        filas_descartadas=filas_descartadas,
+        ruta_parquet=ruta_parquet,
+    )

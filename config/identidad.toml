@@ -1,0 +1,273 @@
+#-----------------------------------------------------------------------------
+# Identidad, watchlist y alcance de ingesta — MCP Mercado Público Bioquimica.cl
+#
+# SIN SECRETOS. El ticket de la API va en la variable de entorno
+# MERCADO_PUBLICO_TICKET, nunca aquí.
+#
+# Derivado del spike del 2026-08-05: perfilado de la watchlist contra
+# oc-da/2026-6 (437.538 líneas) + consulta al MCP de catálogo de Bioquímica.
+# Ver docs/esquema-datos-abiertos.md y docs/alcance-y-competencia.md
+#-----------------------------------------------------------------------------
+
+[nosotros]
+# ✅ RESUELTO 2026-08-05. RUT entregado por el usuario, DV validado (mod-11 = 6).
+# CodigoProveedor y razón social derivados de oc-da/2026-6 sin gastar cuota de API.
+rut = "76.563.320-6"
+codigo_proveedor = "1202804"
+razon_social_mp = "BIOQUIMICA.CL.S.A."
+giro_mp = "FABRICACION DE PRODUCTOS FARMACEUTICOS, SUSTANCIAS QUIMICAS MEDICINALES"
+
+# --- Escala real, medida en oc-da/2026-6 -------------------------------------
+# 174 líneas de OC, $44.991.872 CLP neto en el mes.
+# Comparación que ordena el proyecto: Arquimed facturó $4.218.769.540 el mismo
+# mes — 94x más. Arquimed NO es competencia comparable. Ver [competencia.liga_a].
+
+# --- Compradores reales (2026-06) --------------------------------------------
+# Municipios y educación, NO hospitales:
+#   CORP MUNICIPAL DE DESARROLLO SOCIAL DE LAMPA (49 líneas)
+#   SERVICIO LOCAL DE EDUCACIÓN PÚBLICA DEL ELQUI (20)
+#   UNIVERSIDAD DE TALCA (17) · I MUNICIPALIDAD DE QUILLON (11)
+#   UNIVERSIDAD DE ANTOFAGASTA (10) · UNIVERSIDAD DE CHILE (9)
+
+# --- Productos más vendidos --------------------------------------------------
+#   Reactivos o soluciones químicos (20) · Materiales educativos sobre ciencia (11)
+#   Alcoholes o sus sustitutos (10) · Unidades de laboratorio (9)
+#   Accesorios de analizadores químicos (7) · Electroforesis (6)
+#   imanes Alnico (6) · Barómetros (5)
+
+# --- 🎯 MEZCLA DE CANAL — el hallazgo que reordena las prioridades -----------
+# Del monto de OC de 2026-06:
+#   76,4 %  ProcedenciaOC = "NA"  (compra ágil / trato directo)   $34.389.921
+#   19,5 %  Proveniente de licitación pública                      $8.766.551
+#    4,1 %  Proveniente de licitación privada                      $1.835.400
+#
+# El negocio entra por COMPRA ÁGIL, no por licitación. El dataset COT pasa a ser
+# la fuente primaria, por delante de lic-da.
+[nosotros.canal_2026_06]
+compra_agil_o_trato_directo = 34389921
+licitacion_publica = 8766551
+licitacion_privada = 1835400
+
+# --- Tasa de éxito medida (COT1 2026-06) -------------------------------------
+# 26 cotizaciones distintas · 40 líneas ganadas · 96 perdidas → 29,4 % de éxito.
+# Las 96 líneas perdidas son la oportunidad cuantificada del proyecto.
+[nosotros.win_rate_compra_agil_2026_06]
+lineas_ganadas = 40
+lineas_perdidas = 96
+tasa = 0.294
+cotizaciones_distintas = 26
+
+
+#-----------------------------------------------------------------------------
+# ALCANCE DE INGESTA
+#-----------------------------------------------------------------------------
+[ingesta]
+# Decisión del usuario (2026-08-05): historia 2025-2026.
+periodo_desde = "2025-1"
+periodo_hasta = "2026-8"
+datasets = ["oc", "lic", "cot"]
+
+# El filtro de ingesta es por RUBRO, no por RUT.
+#
+# Motivo medido: la watchlist de 33 RUT captura sólo el 16,3 % del monto de los
+# rubros de laboratorio en 2026-06. Filtrar la ingesta por esos RUT haría
+# imposible calcular distribuciones de precio (falta el resto de los oferentes),
+# detectar entrantes nuevos (por definición no están en una lista previa) y
+# saber quién ganó cuando el ganador está fuera de la lista.
+#
+# La watchlist [competencia] es una lista de PRIORIDAD, no un filtro de datos.
+filtro = "rubro_n1"
+
+
+[[ingesta.rubros_n1]]
+nombre = "Equipamiento para laboratorios"
+motivo = "Núcleo del catálogo: vidrio, buretas, equipos e insumos de laboratorio"
+subrubros_clave = [
+  "Instrumentos de medida y experimentación",
+  "Equipos e insumos para laboratorio",
+  "Suministros para laboratorios",
+]
+
+[[ingesta.rubros_n1]]
+nombre = "Productos químicos industriales"
+motivo = "Línea de reactivos del catálogo (SKU RP*): ácidos, sales, solventes"
+subrubros_clave = ["Compuestos y mezclas", "Solventes", "Colorantes", "Aditivos", "Metales y gases"]
+
+[[ingesta.rubros_n1]]
+# ⚠️ NOMBRE CORREGIDO 2026-08-05 al construir el ETL (HU-2.4): el valor real de
+# RubroN1 en oc-da/2026-6 es "...artesanías y materiales educativos" completo,
+# no "...artesanía" a secas como se había escrito de memoria. Verificado con
+# DuckDB contra el CSV real (437.538 filas) antes de fijar el filtro: con el
+# nombre viejo, un filtro por igualdad estricta habría descartado ESTE rubro
+# completo en silencio — el de material didáctico, el más importante.
+nombre = "Instrumentos musicales, juegos, juguetes, artesanías y materiales educativos"
+motivo = """
+⚠️ CONTRAINTUITIVO PERO CRÍTICO. Aquí está clasificado el material didáctico de
+ciencias — la línea MD*/EK*/RV* del catálogo (kits escolares, modelos
+anatómicos, diapasones, circuitos). El subrubro 'Materiales, artículos y
+suministros didácticos' movió $1.417 M en 3.386 líneas en un solo mes.
+Un filtro definido por intuición ('rubros médicos y de laboratorio') habría
+perdido esta línea de negocio completa."""
+subrubros_clave = [
+  "Materiales, artículos y suministros didácticos",
+  "Equipos de arte y manualidades, accesorios y suministros",
+  "Juguetes y juegos",
+]
+
+[[ingesta.rubros_n1]]
+nombre = "Muebles y mobiliario"
+motivo = "Mesones de laboratorio del catálogo (SKU IL*MES). Ojo: los compradores a veces los clasifican en 'Estructuras prefabricadas'"
+subrubros_clave = [
+  "Mobiliario y accesorios institucional, educativo",
+  "Muebles comerciales e industriales",
+]
+
+[[ingesta.rubros_n1]]
+# ⚠️ NOMBRE CORREGIDO 2026-08-05 (mismo motivo que el rubro anterior): el valor
+# real es "...estructuras, obras y construcciones" completo.
+nombre = "Artículos para estructuras, obras y construcciones"
+motivo = "Confirmado con datos propios: Bioquímica vendió 9 líneas aquí en 2026-06 ('Unidades de laboratorio' del catálogo). Varios competidores también aparecen clasificados en este rubro"
+subrubros_clave = ["Estructuras prefabricadas"]
+
+[[ingesta.rubros_n1]]
+nombre = "Educación, formación, entrenamiento y capacitación"
+motivo = "'Sistemas educativos complementarios' ($2.469 M/mes) puede incluir kits educativos empaquetados. VERIFICAR: el top de proveedores son OTEC y universidades vendiendo servicios, no material — quizá descartable"
+subrubros_clave = ["Sistemas educativos complementarios"]
+estado = "a_verificar"
+
+[[ingesta.rubros_n1]]
+nombre = "Servicios de producción y fabricación industrial"
+motivo = "'Industrias de plásticos y productos químicos' — posible solape con reactivos y plásticos de laboratorio"
+subrubros_clave = ["Industrias de plásticos y productos químicos"]
+estado = "a_verificar"
+
+
+#-----------------------------------------------------------------------------
+# WATCHLIST DE COMPETENCIA
+#
+# 33 RUT entregados por el usuario el 2026-08-05, validados con dígito
+# verificador mod-11 y perfilados contra oc-da/2026-6.
+#
+# Segmentados en ligas porque NO todos compiten con el catálogo de Bioquímica:
+# los de la liga A venden instrumental científico caro a hospitales; el catálogo
+# de Bioquímica son reactivos de $5-20 mil, vidrio, mobiliario y material
+# didáctico STEM. Comparar precios entre ligas produce conclusiones falsas.
+#-----------------------------------------------------------------------------
+
+[competencia]
+# Métricas de la muestra 2026-06 (un mes, sólo CLP, monto = totalLineaNeto)
+# 22 de los 34 RUT tuvieron actividad ese mes.
+
+# --- LIGA A: instrumental científico y clínico de alto ticket -----------------
+# Compradores: hospitales y servicios de salud. Comparabilidad con el catálogo
+# de Bioquímica: BAJA. Útiles para vigilar, no para benchmark de precios.
+liga_a = [
+  { rut = "92.999.000-5", nombre = "IMPORTADORA Y DISTRIBUIDORA ARQUIMED LTDA", clp_2026_06 = 4218769540, lineas = 1050, nota = "líder de la watchlist, 3,4x el segundo" },
+  { rut = "79.895.670-1", nombre = "PV EQUIP SA",                    clp_2026_06 = 1234582674, lineas = 828 },
+  { rut = "96.540.690-5", nombre = "GRUPO BIOS S.A.",                 clp_2026_06 = 1216419080, lineas = 490 },
+  { rut = "79.622.060-0", nombre = "GALENICA S A",                    clp_2026_06 = 1194410832, lineas = 758 },
+  { rut = "96.625.950-7", nombre = "TECNIKA S A",                     clp_2026_06 =  953434012, lineas = 960, nota = "quirúrgico y anestesia, fuera del catálogo" },
+  { rut = "77.453.910-7", nombre = "LIFE TECHNOLOGIES CHILE SPA",     clp_2026_06 =  608976495, lineas = 182 },
+  { rut = "80.621.200-8", nombre = "MERCK S A",                       clp_2026_06 =  237345234, lineas = 289 },
+  { rut = "77.116.540-0", nombre = "PERKIN ELMER CHILE LIMITADA",     clp_2026_06 =   18662816, lineas =   9 },
+]
+
+# --- LIGA B: suministros de laboratorio a universidades ----------------------
+# 🎯 Competencia REAL del catálogo. Compradores: universidades, municipios,
+# ISP, INIA. Tickets bajos. Es aquí donde benchmark_precio() y
+# precio_para_ganar() dan señal accionable.
+liga_b = [
+  { rut = "76.131.142-5", nombre = "QuoRux Chile SPA",                            clp_2026_06 = 267337839, lineas = 453 },
+  { rut = "77.647.010-4", nombre = "SOC COMERCIAL MIHOVILOVIC HNOS Y OTRO LTDA",  clp_2026_06 = 132334460, lineas = 236, nota = "único con USD en la muestra (10 líneas)" },
+  { rut = "79.722.860-5", nombre = "WINKLER LIMITADA",                            clp_2026_06 = 129667804, lineas = 579, nota = "fuertísimo en universidades regionales" },
+  { rut = "78.027.120-5", nombre = "Diprolab Ltda.",                              clp_2026_06 =  89370212, lineas = 325 },
+  { rut = "76.800.750-0", nombre = "COMERCIALIZADORA HEALTH EQUIPMENT SUPPLY LTDA", clp_2026_06 = 37471759, lineas = 49 },
+  { rut = "76.630.573-3", nombre = "LORTECH SPA",                                 clp_2026_06 =  30768517, lineas =  22 },
+  { rut = "96.691.070-4", nombre = "Mundolab S.A.",                               clp_2026_06 =  25176511, lineas = 100 },
+  { rut = "78.116.970-6", nombre = "Soviquim Ltda.",                              clp_2026_06 =  18930123, lineas = 156 },
+  { rut = "79.591.440-4", nombre = "Crisvert Limitada",                           clp_2026_06 =   9507269, lineas =  54 },
+  { rut = "77.332.128-0", nombre = "INSUMOS Y TECNOLOGÍA PARA LABORATORIOS SPA",  clp_2026_06 =   8628776, lineas =   5 },
+  { rut = "83.083.700-0", nombre = "IMPORTADORA DILACO S.A",                      clp_2026_06 =   8078600, lineas =  26 },
+  { rut = "96.605.640-1", nombre = "COMERCIAL VIMARONI S A",                      clp_2026_06 =   4858478, lineas =  48 },
+  { rut = "76.288.488-7", nombre = "Cynthia Alejandra (razón social truncada)",    clp_2026_06 =   4643316, lineas =  17 },
+  { rut = "77.101.430-5", nombre = "Comercial y Asesora Internacional Sagu Ltda.", clp_2026_06 =   2308686, lineas =  14 },
+]
+
+# --- Sin actividad en 2026-06 ------------------------------------------------
+# No significa inactivos: un mes es una muestra chica. Se resuelven al cargar
+# los 20 meses. Si siguen vacíos, revisar si el RUT es correcto.
+sin_actividad_2026_06 = [
+  "93.020.000-K", "86.821.000-1", "88.284.000-K", "96.729.480-2",
+  "78.804.130-6", "78.762.910-5", "76.502.658-K", "76.392.172-7",
+  "76.632.266-2", "76.791.589-6",
+]
+
+# --- Dato a corregir ---------------------------------------------------------
+# El RUT 77.814.808-2 tiene dígito verificador inválido (mod-11 exige 0).
+# Se ingiere la variante corregida; confirmar con el usuario.
+[[competencia.dudosos]]
+rut_entregado = "77.814.808-2"
+rut_corregido = "77.814.808-0"
+problema = "dígito verificador inválido; ninguna de las dos variantes tuvo actividad en 2026-06"
+
+
+#-----------------------------------------------------------------------------
+# PUNTO CIEGO CONOCIDO
+#-----------------------------------------------------------------------------
+[brechas]
+# ⚠️ MEDIDO 2026-08-05: la watchlist apunta al universo donde Bioquímica compite
+# MENOS. Al cruzar el RUT propio contra las licitaciones y compras ágiles en que
+# efectivamente participó en 2026-06, los rivales reales casi no la intersectan.
+lideres_fuera_de_watchlist = "confirmar si diagnóstico clínico in-vitro está fuera del negocio"
+
+# --- Universo 1: licitaciones de material didáctico --------------------------
+# Rivales en las 3 licitaciones donde Bioquímica ofertó en 2026-06.
+# Coincidencias con la watchlist de 33 RUT: 0 de 10.
+[[brechas.rivales_no_listados]]
+universo = "licitaciones de material didáctico"
+en_watchlist = 0
+detectados = [
+  { rut = "76.737.787-8", nombre = "Tepullin Didáctico SPA",  coincidencias = 10 },
+  { rut = "76.341.344-6", nombre = "Sociedad Comercial Vercon SPA", coincidencias = 7 },
+  { rut = "77.964.116-3", nombre = "PETIWI",                  coincidencias = 5 },
+  { rut = "76.591.500-7", nombre = "Aula Editores",           coincidencias = 5 },
+  { rut = "78.366.382-1", nombre = "Mundo Ludico",            coincidencias = 4 },
+  { rut = "77.262.930-3", nombre = "Masterwise",              coincidencias = 3 },
+  { rut = "77.544.792-3", nombre = "JACH",                    coincidencias = 2 },
+  { rut = "78.091.613-3", nombre = "GENIOS Y LÚDICOS",        coincidencias = 2 },
+  { rut = "78.189.522-9", nombre = "Liquidadora RyS",         coincidencias = 2 },
+  { rut = "76.779.377-4", nombre = "Alteria Tech",            coincidencias = 2 },
+]
+
+# --- Universo 2: compra ágil de laboratorio ----------------------------------
+# Rivales en las 26 compras ágiles donde Bioquímica cotizó en 2026-06.
+# Coincidencias con la watchlist: 2 de 12.
+[[brechas.rivales_no_listados]]
+universo = "compra ágil de laboratorio (76 % del negocio)"
+en_watchlist = 2
+detectados = [
+  { rut = "76.502.658-K", nombre = "DISTRIBUIDORA DE PRODUCTOS DE LABORATORIO", coincidencias = 61, en_watchlist = true, nota = "rival #1 real; en la watchlist figuraba sin actividad" },
+  { rut = "13.722.244-2", nombre = "LILIANA PATRICIA LÓPEZ PRIETO", coincidencias = 60, nota = "persona natural — RUT de 8 dígitos, no empresa" },
+  { rut = "78.116.970-6", nombre = "IMPORTADORA SOVIQUIM LIMITADA", coincidencias = 12, en_watchlist = true },
+  { rut = "89.752.800-2", nombre = "DISTRIBUIDORA DE ARTICULOS MEDICOS P", coincidencias = 11 },
+  { rut = "76.548.530-4", nombre = "QUANTECH CIENCIA Y TECNOLOGÍA SPA", coincidencias = 9 },
+  { rut = "77.884.799-K", nombre = "COMERCIAL E INVERSIONES RMA SPA", coincidencias = 9 },
+  { rut = "78.230.123-3", nombre = "VALQUILA SPA", coincidencias = 8 },
+  { rut = "77.710.483-7", nombre = "COMERCIALIZADORA S & C SPA", coincidencias = 8 },
+  { rut = "78.151.009-2", nombre = "INVERSIONES SAPUNAR GONZALEZ SPA", coincidencias = 8 },
+  { rut = "78.229.501-2", nombre = "DISTRIBUIDORA MK SPA", coincidencias = 7 },
+  { rut = "78.333.189-6", nombre = "MULTISERVICIOS & PROVISIONES SPA", coincidencias = 7 },
+  { rut = "78.321.973-5", nombre = "COMERCIALIZADORA Y DISTRIBUIDORA CG", coincidencias = 7 },
+]
+
+# Conclusión de diseño: la watchlist NO puede ser la fuente de verdad de
+# "quién es la competencia". El MCP debe DESCUBRIR rivales por co-participación
+# (mismo código de licitación / cotización), y usar la watchlist sólo como
+# lista de seguimiento adicional.
+metodo_correcto = "descubrir rivales por co-participación en licitación/cotización, no por lista manual"
+
+# --- Rubro faltante en [ingesta.rubros_n1] -----------------------------------
+# Bioquímica vendió 9 líneas en RubroN1 'Artículos para estructuras' >
+# 'Estructuras prefabricadas' (las 'Unidades de laboratorio' del catálogo).
+# Agregar ese RubroN1 al filtro de ingesta.
+rubro_n1_faltante = "Artículos para estructuras (subrubro: Estructuras prefabricadas)"
