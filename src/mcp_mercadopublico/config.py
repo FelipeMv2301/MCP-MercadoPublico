@@ -229,6 +229,9 @@ class Settings(BaseModel):
     manifest_path: Path = RAIZ_PROYECTO / "data" / "manifest.sqlite"
     cache_path: Path = RAIZ_PROYECTO / "data" / "cache.sqlite"
     mapeos_path: Path = RAIZ_PROYECTO / "data" / "mapeos.sqlite"
+    mcp_auth_token: str | None = None
+    scheduler_habilitado: bool = False
+    scheduler_intervalo_segundos: float = 6 * 60 * 60
     # Deliberadamente FUERA de data_dir: el scratch de ingesta (ZIP + CSV
     # intermedios, hasta ~1,34 GB por periodo) no debe vivir en el Volume
     # persistente de Railway — se descarta al terminar cada periodo (HU-2.2,
@@ -257,6 +260,13 @@ class Settings(BaseModel):
                 "para consultar la API en línea de Mercado Público (Plano A)."
             )
         return self.mercado_publico_tickets[0]
+
+    @property
+    def expuesto_a_internet(self) -> bool:
+        """True si el host de bind no es loopback — HU-7.1: sólo entonces es
+        obligatorio MCP_AUTH_TOKEN. Correr en 127.0.0.1 (default local) no
+        es alcanzable desde fuera de la máquina, así que no lo exige."""
+        return self.host not in ("127.0.0.1", "localhost", "::1")
 
 
 @lru_cache(maxsize=1)
@@ -298,6 +308,14 @@ def get_settings() -> Settings:
         else Path(tempfile.gettempdir()) / "mcp_mercadopublico_scratch"
     )
 
+    mcp_auth_token = os.environ.get("MCP_AUTH_TOKEN") or None
+    scheduler_habilitado = os.environ.get("SCHEDULER_ENABLED", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    scheduler_intervalo_segundos = float(
+        os.environ.get("SCHEDULER_INTERVALO_SEGUNDOS", str(6 * 60 * 60))
+    )
+
     # Railway inyecta PORT (no MCP_PORT) y espera que el proceso escuche ahí
     # — tiene prioridad. MCP_PORT queda como override explícito para local/
     # otros hosts; 8000 es el default sin ninguno de los dos.
@@ -314,6 +332,9 @@ def get_settings() -> Settings:
         cache_path=data_dir / "cache.sqlite",
         mapeos_path=data_dir / "mapeos.sqlite",
         scratch_dir=scratch_dir,
+        mcp_auth_token=mcp_auth_token,
+        scheduler_habilitado=scheduler_habilitado,
+        scheduler_intervalo_segundos=scheduler_intervalo_segundos,
     )
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.mkdir(parents=True, exist_ok=True)

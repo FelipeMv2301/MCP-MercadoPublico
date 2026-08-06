@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
+import uvicorn
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from mcp_mercadopublico import catalogo, inteligencia, precios
+from mcp_mercadopublico.auth import AutenticacionBearerMiddleware
 from mcp_mercadopublico.config import get_settings
 from mcp_mercadopublico.formato.tsv_xml import filas_a_tsv_xml
 from mcp_mercadopublico.lake.etl import ingerir_periodo
+from mcp_mercadopublico import limites
+from mcp_mercadopublico.scheduler import lifespan_con_ingesta_periodica
 from mcp_mercadopublico.lake.manifest import listar_periodos
 from mcp_mercadopublico.lake.periodos import generar_periodos
 from mcp_mercadopublico.logging_setup import configurar_logging
@@ -47,6 +50,7 @@ adviértelo antes de concluir.\
 mcp = MCPServer(
     name="mercado-publico-bioquimica",
     instructions=INSTRUCCIONES,
+    lifespan=lambda _server: lifespan_con_ingesta_periodica(get_settings),
 )
 
 
@@ -158,6 +162,16 @@ def ingerir_datos_abiertos(
     except ValueError as exc:
         return {"error": str(exc)}
 
+    if len(periodos) > limites.MAX_PERIODOS_POR_INGESTA:
+        return {
+            "error": (
+                f"Rango de {len(periodos)} periodos excede el máximo de "
+                f"{limites.MAX_PERIODOS_POR_INGESTA} por llamada (~3 años). "
+                "Pedirlo en tandas más chicas — cada periodo descarga y "
+                "procesa hasta ~1,3 GB descomprimidos."
+            )
+        }
+
     rubros_permitidos = (
         [r.nombre for r in identidad.ingesta.rubros_n1] if dataset in ("oc", "lic") else None
     )
@@ -245,10 +259,9 @@ def buscar_producto_en_historial(
             ),
         }
 
-    con = duckdb.connect()
     try:
-        coincidencias = catalogo.buscar_producto_en_historial(
-            con,
+        coincidencias = limites.consultar(
+            catalogo.buscar_producto_en_historial,
             settings.data_dir,
             texto=texto,
             codigo_onu=codigo_onu,
@@ -256,8 +269,8 @@ def buscar_producto_en_historial(
             rut_propio=settings.identidad.nosotros.rut if solo_propio else None,
             limite=limite,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
 
     return {
         "resultados": [
@@ -342,18 +355,17 @@ def descubrir_rivales(canal: str | None = None, limite: int = 30) -> dict:
     identidad = settings.identidad
     watchlist = set(identidad.competencia.todos_los_rut())
 
-    con = duckdb.connect()
     try:
-        rivales = inteligencia.descubrir_rivales(
-            con,
+        rivales = limites.consultar(
+            inteligencia.descubrir_rivales,
             settings.data_dir,
             identidad.nosotros.rut,
             canal=canal,
             ruts_watchlist=watchlist,
             limite=limite,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
 
     return {
         "rivales": [
@@ -389,13 +401,13 @@ def perfil_competidor(rut: str, top_n: int = 5) -> dict:
     liga_a = {c.rut for c in identidad.competencia.liga_a}
     liga_b = {c.rut for c in identidad.competencia.liga_b}
 
-    con = duckdb.connect()
     try:
-        perfil = inteligencia.perfil_competidor(
-            con, settings.data_dir, rut, liga_a=liga_a, liga_b=liga_b, top_n=top_n
+        perfil = limites.consultar(
+            inteligencia.perfil_competidor,
+            settings.data_dir, rut, liga_a=liga_a, liga_b=liga_b, top_n=top_n,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
 
     return {
         "rut": perfil.rut,
@@ -438,10 +450,9 @@ def radar_competencia(
         limite: máximo de proveedores a devolver.
     """
     settings = get_settings()
-    con = duckdb.connect()
     try:
-        movimientos = inteligencia.radar_competencia(
-            con,
+        movimientos = limites.consultar(
+            inteligencia.radar_competencia,
             settings.data_dir,
             anio=anio,
             mes=mes,
@@ -450,8 +461,8 @@ def radar_competencia(
             rubro_n1=rubro_n1,
             limite=limite,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
 
     return {
         "periodo_actual": f"{anio}-{mes}",
@@ -489,14 +500,16 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
         canal: 'lic', 'cot' o None (ambos).
     """
     settings = get_settings()
-    con = duckdb.connect()
     try:
-        cruces = inteligencia.head_to_head(
-            con, settings.data_dir, settings.identidad.nosotros.rut, rut_rival, canal=canal
+        cruces = limites.consultar(
+            inteligencia.head_to_head,
+            settings.data_dir, settings.identidad.nosotros.rut, rut_rival, canal=canal,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
 
+    # Resumen sobre TODOS los cruces (no se pierde precisión); el detalle
+    # que se devuelve sí se acota — head_to_head() no traía límite propio.
     n_cruces = len(cruces)
     ganados = sum(1 for c in cruces if c.ganador == "nosotros")
     diferencias = sorted(c.diferencia_pct for c in cruces if c.diferencia_pct is not None)
@@ -510,6 +523,9 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
             f"Sólo {n_cruces} cruce(s) encontrados: tratar como anécdota, no como patrón."
         )
 
+    truncado = n_cruces > limites.MAX_CRUCES_HEAD_TO_HEAD
+    cruces_mostrados = cruces[: limites.MAX_CRUCES_HEAD_TO_HEAD] if truncado else cruces
+
     return {
         "rut_rival": rut_rival,
         "resumen": {
@@ -518,6 +534,7 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
             "diferencia_pct_mediana": diferencia_mediana,
             "advertencia": advertencia,
         },
+        "cruces_truncados": truncado,
         "cruces": [
             {
                 "canal": c.canal,
@@ -529,7 +546,7 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
                 "ganador": c.ganador,
                 "criterio": c.criterio,
             }
-            for c in cruces
+            for c in cruces_mostrados
         ],
     }
 
@@ -575,11 +592,12 @@ def benchmark_precio(producto: str, canal: str | None = None) -> dict:
             ),
         }
 
-    con = duckdb.connect()
     try:
-        r = precios.benchmark_precio(con, settings.data_dir, meta["codigo_onu"], canal=canal)
-    finally:
-        con.close()
+        r = limites.consultar(
+            precios.benchmark_precio, settings.data_dir, meta["codigo_onu"], canal=canal
+        )
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"producto_consultado": producto, **meta, "error": str(exc)}
 
     return {
         "producto_consultado": producto,
@@ -626,13 +644,13 @@ def precio_para_ganar(producto: str, organismo: str | None = None, canal: str | 
             ),
         }
 
-    con = duckdb.connect()
     try:
-        r = precios.precio_para_ganar(
-            con, settings.data_dir, meta["codigo_onu"], organismo=organismo, canal=canal
+        r = limites.consultar(
+            precios.precio_para_ganar,
+            settings.data_dir, meta["codigo_onu"], organismo=organismo, canal=canal,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"producto_consultado": producto, **meta, "error": str(exc)}
 
     return {
         "producto_consultado": producto,
@@ -681,13 +699,13 @@ def criterios_que_deciden(
             meta["codigo_onu"], meta["metodo_resolucion"], meta["confianza"],
         )
 
-    con = duckdb.connect()
     try:
-        r = precios.criterios_que_deciden(
-            con, settings.data_dir, codigo_onu=codigo_onu, rubro_n1=rubro_n1, canal=canal
+        r = limites.consultar(
+            precios.criterios_que_deciden,
+            settings.data_dir, codigo_onu=codigo_onu, rubro_n1=rubro_n1, canal=canal,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"producto_consultado": producto, "error": str(exc)}
 
     return {
         "producto_consultado": producto,
@@ -713,13 +731,13 @@ def postmortem(codigo_proceso: str) -> dict:
                         o código de cotización (ej. '1079967-350-COT26').
     """
     settings = get_settings()
-    con = duckdb.connect()
     try:
-        pm = precios.postmortem(
-            con, settings.data_dir, codigo_proceso, rut_propio=settings.identidad.nosotros.rut
+        pm = limites.consultar(
+            precios.postmortem,
+            settings.data_dir, codigo_proceso, rut_propio=settings.identidad.nosotros.rut,
         )
-    finally:
-        con.close()
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"codigo_proceso": codigo_proceso, "error": str(exc)}
 
     if pm.canal is None:
         return {
@@ -761,11 +779,12 @@ def perfil_comprador(organismo: str, top_n: int = 5) -> dict:
         top_n: cuántos rubros/productos/proveedores top devolver.
     """
     settings = get_settings()
-    con = duckdb.connect()
     try:
-        perfil = precios.perfil_comprador(con, settings.data_dir, organismo, top_n=top_n)
-    finally:
-        con.close()
+        perfil = limites.consultar(
+            precios.perfil_comprador, settings.data_dir, organismo, top_n=top_n
+        )
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"organismo": organismo, "error": str(exc)}
 
     if perfil.n_lineas == 0:
         return {
@@ -810,10 +829,31 @@ def main() -> None:
                 "host": settings.host,
                 "port": settings.port,
                 "ticket_configurado": settings.tiene_ticket,
+                "auth_configurado": bool(settings.mcp_auth_token),
             }
         },
     )
-    mcp.run(transport="streamable-http", host=settings.host, port=settings.port)
+
+    if settings.expuesto_a_internet and not settings.mcp_auth_token:
+        # HU-7.1: el endpoint no puede quedar accesible sin autenticación.
+        # 127.0.0.1 (default local) no es alcanzable desde fuera de la
+        # máquina, así que sólo se exige cuando el bind es a 0.0.0.0/etc.
+        raise RuntimeError(
+            "MCP_HOST no es loopback pero MCP_AUTH_TOKEN no está configurado. "
+            "El servidor quedaría expuesto sin autenticación — no arranca así. "
+            "Definir MCP_AUTH_TOKEN antes de desplegar."
+        )
+
+    app = mcp.streamable_http_app(host=settings.host)
+    if settings.mcp_auth_token:
+        app = AutenticacionBearerMiddleware(app, settings.mcp_auth_token)
+    else:
+        logger.warning(
+            "servidor_sin_autenticacion",
+            extra={"extra_fields": {"detalle": "MCP_AUTH_TOKEN no configurado — sólo aceptable en loopback"}},
+        )
+
+    uvicorn.run(app, host=settings.host, port=settings.port, log_config=None)
 
 
 if __name__ == "__main__":
