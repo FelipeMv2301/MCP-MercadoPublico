@@ -7,6 +7,7 @@ persistir el resultado en el manifest no es una ingesta utilizable.
 
 from __future__ import annotations
 
+import csv
 import logging
 import shutil
 from dataclasses import dataclass
@@ -157,6 +158,110 @@ def _clausula_filtro(
 # --------------------------------------------------------------------------
 
 
+def _header_con_python(ruta: Path) -> list[str]:
+    """Lee el header con el parser CSV de Python, que es más tolerante que el
+    de DuckDB. Usado para armar `columns=` explícito y saltar el sniffer."""
+    csv.field_size_limit(10**9)
+    with ruta.open(encoding="utf-8", newline="") as f:
+        return next(csv.reader(f, delimiter=";", quotechar='"'))
+
+
+def _contar_filas_con_python(rutas: list[Path]) -> int:
+    """Cuenta filas de datos con el parser de Python (tolerante), para poder
+    reportar cuántas descartó DuckDB en el camino tolerante."""
+    csv.field_size_limit(10**9)
+    total = 0
+    for ruta in rutas:
+        with ruta.open(encoding="utf-8", newline="") as f:
+            lector = csv.reader(f, delimiter=";", quotechar='"')
+            next(lector, None)  # header
+            total += sum(1 for _ in lector)
+    return total
+
+
+def _leer_csv(
+    con: duckdb.DuckDBPyConnection,
+    origen: str | list[str],
+    rutas_csv: list[Path],
+    dataset: str,
+    anio: int,
+    mes: int,
+) -> duckdb.DuckDBPyRelation:
+    """Lee los CSV con DuckDB, con un camino tolerante para archivos que no
+    cumplen RFC 4180.
+
+    Bug real encontrado en producción (2026-08-06): `lic-da/2026-3` aborta con
+    "The CSV Parser state machine reached an invalid state". El archivo trae
+    5 filas malformadas entre 160.271 (comillas sin escapar) — el parser de
+    Python las tolera, el sniffer de dialecto de DuckDB aborta el archivo
+    entero. Un periodo así se perdía por completo.
+
+    Camino rápido (la mayoría de los periodos): read_csv normal.
+    Camino tolerante: columnas explícitas (salta el sniffer, que es lo que
+    realmente falla) + strict_mode=False + ignore_errors. Ese camino SÍ
+    descarta filas, así que se cuenta con Python y se registra el delta —
+    nunca se pierde data en silencio (regla transversal del proyecto).
+    """
+    try:
+        relacion_rapida = con.read_csv(
+            origen,
+            delimiter=";",
+            quotechar='"',
+            encoding="UTF-8",
+            header=True,
+            all_varchar=True,
+            sample_size=200_000,
+        )
+        # read_csv() es LAZY: no valida el archivo hasta que se consulta la
+        # relación. Sin este COUNT dentro del try, el error de parseo escapa
+        # del except y el camino tolerante nunca se usa.
+        con.execute("SELECT COUNT(*) FROM relacion_rapida").fetchone()
+        return relacion_rapida
+    except duckdb.Error as exc:
+        logger.warning(
+            "csv_no_rfc4180_usando_camino_tolerante",
+            extra={
+                "extra_fields": {
+                    "dataset": dataset,
+                    "periodo": f"{anio}-{mes}",
+                    "error_duckdb": str(exc)[:200],
+                }
+            },
+        )
+
+    columnas = {nombre: "VARCHAR" for nombre in _header_con_python(rutas_csv[0])}
+    relacion = con.read_csv(
+        origen,
+        delimiter=";",
+        quotechar='"',
+        encoding="UTF-8",
+        header=True,
+        columns=columnas,
+        strict_mode=False,
+        ignore_errors=True,
+    )
+
+    filas_duckdb = con.execute("SELECT COUNT(*) FROM relacion").fetchone()[0]
+    filas_python = _contar_filas_con_python(rutas_csv)
+    descartadas = filas_python - filas_duckdb
+    if descartadas > 0:
+        logger.warning(
+            "csv_filas_descartadas_por_malformacion",
+            extra={
+                "extra_fields": {
+                    "dataset": dataset,
+                    "periodo": f"{anio}-{mes}",
+                    "filas_parseables": filas_python,
+                    "filas_leidas": filas_duckdb,
+                    "descartadas": descartadas,
+                    "pct_descartado": round(100 * descartadas / max(filas_python, 1), 3),
+                }
+            },
+        )
+
+    return relacion
+
+
 def transformar_y_escribir(
     con: duckdb.DuckDBPyConnection,
     dataset: str,
@@ -176,15 +281,7 @@ def transformar_y_escribir(
     se trunca en silencio, el llamador debe loggear ese delta.
     """
     origen = str(rutas_csv[0]) if len(rutas_csv) == 1 else [str(r) for r in rutas_csv]
-    rel_origen = con.read_csv(
-        origen,
-        delimiter=";",
-        quotechar='"',
-        encoding="UTF-8",
-        header=True,
-        all_varchar=True,
-        sample_size=200_000,
-    )
+    rel_origen = _leer_csv(con, origen, rutas_csv, dataset, anio, mes)
     filas_leidas = con.execute("SELECT COUNT(*) FROM rel_origen").fetchone()[0]
 
     columnas_originales = rel_origen.columns

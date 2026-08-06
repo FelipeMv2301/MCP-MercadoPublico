@@ -128,6 +128,42 @@ def test_filtro_rubro_es_case_insensitive(con, tmp_path: Path):
     assert filas_escritas == 1  # matchea pese a la diferencia de casing
 
 
+def test_csv_malformado_usa_camino_tolerante_y_avisa(
+    con, tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """Bug real (lic-da/2026-3): el parser estricto de DuckDB aborta el
+    archivo ENTERO por unas pocas filas con comillas sin escapar, y el
+    periodo se perdía completo. El camino tolerante lo rescata y registra
+    cuántas filas se descartaron — nunca en silencio.
+
+    Además cubre que read_csv() es lazy: sin forzar la materialización
+    dentro del try, la excepción escapaba y el fallback no se usaba.
+    """
+    import logging
+
+    contenido = (
+        "ID;RubroN1;codigoProductoONU;precioNeto;monedaItem\n"
+        '1;"Equipamiento para laboratorios";41116007;"100,0";CLP\n'
+        # fila malformada: comilla sin cerrar dentro del campo
+        '2;"Equipamiento para laboratorios";41116008;"20"0,0";CLP\n'
+        '3;"Equipamiento para laboratorios";41116009;"300,0";CLP\n'
+    )
+    csv_path = tmp_path / "malformado.csv"
+    csv_path.write_text(contenido, encoding="utf-8", newline="")
+
+    with caplog.at_level(logging.WARNING, logger="mcp_mercadopublico.lake.etl"):
+        filas_leidas, filas_escritas, ruta = etl.transformar_y_escribir(
+            con, "oc", [csv_path], 2026, 3, tmp_path / "data",
+            rubros_permitidos=["Equipamiento para laboratorios"],
+        )
+
+    # No debe lanzar: el periodo se rescata en vez de perderse entero.
+    assert ruta.exists()
+    assert filas_leidas >= 2  # al menos las filas bien formadas
+    mensajes = [r.message for r in caplog.records]
+    assert any("csv_no_rfc4180_usando_camino_tolerante" in m for m in mensajes)
+
+
 def test_oc_sin_rubros_permitidos_falla(con, tmp_path: Path):
     csv_path = _csv_oc_sintetico(tmp_path / "2026-6.csv")
     with pytest.raises(ValueError, match="rubros_permitidos"):
