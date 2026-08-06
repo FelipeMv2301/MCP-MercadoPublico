@@ -13,6 +13,7 @@ medida que se implementan, sin tocar esta base.
 from __future__ import annotations
 
 import logging
+import shutil
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -97,16 +98,56 @@ async def health(request: Request) -> JSONResponse:
 
 @mcp.tool()
 def verificar_estado() -> dict:
-    """Estado de salud del servidor: configuración cargada, ticket API,
-    identidad propia y alcance de ingesta configurado.
+    """Estado de salud y diagnóstico del servidor: configuración, identidad,
+    estado real del data lake, del scheduler y del espacio en disco.
 
-    Úsala para confirmar que el servidor está operativo antes de diagnosticar
-    cualquier otra tool que falle — si esta tool falla, el problema es de
-    configuración (config/identidad.toml o variables de entorno), no de una
-    tool de negocio específica.
+    Úsala PRIMERO cuando una tool de análisis devuelva resultados vacíos —
+    distingue las tres causas posibles, que se ven iguales desde afuera:
+    (a) el lake todavía no tiene datos ingeridos, (b) el scheduler está
+    apagado o falló, (c) sí hay datos pero el filtro de la consulta no
+    encontró nada. Un resultado vacío NO significa que haya un problema de
+    conexión a base de datos: el lake son archivos Parquet locales, no hay
+    ninguna base remota a la que conectarse.
     """
     settings = get_settings()
     identidad = settings.identidad
+
+    # Estado real del lake, dataset por dataset — un lake vacío es la causa
+    # más común de resultados vacíos y hasta ahora no era visible desde acá.
+    lake: dict[str, object] = {}
+    for ds in ("oc", "lic", "cot"):
+        directorio = settings.data_dir / ds
+        particiones = sorted(directorio.glob("**/*.parquet")) if directorio.exists() else []
+        lake[ds] = {
+            "particiones": len(particiones),
+            "periodos": [p.parent.parent.name + "/" + p.parent.name for p in particiones[:5]],
+        }
+
+    periodos_manifest: list[dict] = []
+    try:
+        for r in listar_periodos(settings.manifest_path):
+            periodos_manifest.append(
+                {
+                    "dataset": r.dataset, "periodo": r.periodo, "estado": r.estado,
+                    "filas_escritas": r.filas_escritas, "ingerido_en": r.ingerido_en,
+                }
+            )
+    except Exception as exc:  # manifest inexistente antes de la 1ª ingesta
+        periodos_manifest = [{"error": f"manifest no legible: {exc}"}]
+
+    espacio: dict[str, object] = {}
+    for nombre, ruta in (("data_dir", settings.data_dir), ("scratch_dir", settings.scratch_dir)):
+        try:
+            ruta.mkdir(parents=True, exist_ok=True)
+            uso = shutil.disk_usage(ruta)
+            espacio[nombre] = {
+                "ruta": str(ruta),
+                "total_gb": round(uso.total / 1e9, 2),
+                "libre_gb": round(uso.free / 1e9, 2),
+            }
+        except Exception as exc:
+            espacio[nombre] = {"ruta": str(ruta), "error": str(exc)}
+
     return {
         "servidor": "ok",
         "nosotros": {
@@ -125,6 +166,17 @@ def verificar_estado() -> dict:
             "liga_b": len(identidad.competencia.liga_b),
         },
         "ticket_api_configurado": settings.tiene_ticket,
+        "scheduler": {
+            "habilitado": settings.scheduler_habilitado,
+            "intervalo_segundos": settings.scheduler_intervalo_segundos,
+            "nota": (
+                "Si habilitado=false, la ingesta automática NO corre — definir "
+                "SCHEDULER_ENABLED=true, o llamar ingerir_datos_abiertos a mano."
+            ),
+        },
+        "lake": lake,
+        "periodos_en_manifest": periodos_manifest,
+        "espacio_en_disco": espacio,
     }
 
 
