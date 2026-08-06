@@ -34,17 +34,31 @@ logger = logging.getLogger(__name__)
 
 INSTRUCCIONES = """\
 Servidor de inteligencia competitiva sobre Mercado Público de Chile para
-Bioquimica.cl. Combina un data lake histórico (licitaciones, órdenes de
-compra y cotizaciones de compra ágil, ~20 meses) con la API en línea.
+Bioquimica.cl (RUT 76.563.320-6). Data lake histórico de licitaciones,
+órdenes de compra y cotizaciones de compra ágil (~20 meses), filtrado a
+nuestros rubros y con TODOS los proveedores del mercado, no sólo uno.
+
+Fuerte en: mercado agregado por producto (distribución de precios de
+ganadores vs. perdedores), historia profunda de un competidor,
+descubrimiento de rivales por co-participación, y la vista desde el
+comprador (qué compra un organismo, a quién, por qué canal).
+
+NO hace: leer documentos ni bases de licitación (usar getOpportunityDocument
+del conector LicitaLab, que sí las indexa con RAG), ni descubrir
+oportunidades nuevas abiertas hoy — ningún conector hace descubrimiento;
+decírselo al usuario en vez de responder con datos históricos como si
+fueran actuales.
 
 Enfoque: entender a la competencia y calibrar precio/argumento de oferta.
-El 76 % del negocio de Bioquimica.cl entra por compra ágil, no licitación —
-priorizar ese canal salvo que la pregunta sea explícitamente sobre
-licitaciones. El data lake es histórico (compra ágil con ~1 mes de lag); para
-oportunidades abiertas hoy, usar la API en línea o el conector LicitaLab.
+El 76 % del negocio entra por compra ágil, no licitación — priorizar ese
+canal salvo que la pregunta sea explícitamente sobre licitaciones. El lake
+es histórico: compra ágil con ~1 mes de rezago, licitaciones y órdenes de
+compra ~1 día.
 
-Toda agregación de precios reporta su tamaño de muestra (n). Con n bajo,
-adviértelo antes de concluir.\
+Toda agregación de precios reporta su tamaño de muestra (n) y la confianza
+de la resolución del producto. Con n bajo o confianza distinta de 'alta',
+adviértelo antes de concluir. El precio no es el único criterio de
+adjudicación: cruzar con criterios_que_deciden antes de recomendar bajarlo.\
 """
 
 mcp = MCPServer(

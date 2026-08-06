@@ -2,6 +2,17 @@
 
 ## 1. Instrucciones personalizadas (pegar en claude.ai)
 
+> ⚠️ **Versión más completa disponible:** para el uso real con los tres conectores
+> (este MCP + LicitaLab + Catálogo BQ), usar
+> **[`instrucciones-proyecto-claude.md`](instrucciones-proyecto-claude.md)**, que
+> documenta la división de trabajo verificada contra los schemas reales de LicitaLab.
+> El bloque de abajo es la versión corta, sólo sobre este MCP.
+>
+> **Corrección (2026-08-06):** el punto 4 de abajo decía que "LicitaLab detecta
+> oportunidades abiertas". Es falso — `findOpportunityTool` busca por código, no
+> descubre oportunidades nuevas. Ningún conector hace descubrimiento. Corregido en
+> el texto.
+
 Van en **Configuración → Personalización → Instrucciones personalizadas** (o en las
 instrucciones de un Proyecto, si el uso es siempre desde ahí). Complementan — no
 reemplazan — el campo `instructions` que el servidor ya envía por protocolo MCP
@@ -25,9 +36,11 @@ Cuando uses el conector "mercado-publico-bioquimica":
    HOY" usa el conector LicitaLab o la API en línea, no el lake — el lake sirve para
    calibrar precio/argumento, no para detectar oportunidades del momento.
 
-4. DIVISIÓN DE TRABAJO: LicitaLab detecta oportunidades abiertas; este MCP calibra
-   precio y analiza competencia sobre el histórico. Son complementarios: LicitaLab
-   dice "esto se abrió", este MCP dice "a qué precio y contra quién".
+4. DIVISIÓN DE TRABAJO: LicitaLab consulta UNA oportunidad por su código y LEE SUS
+   BASES (getOpportunityDocument, con RAG); este MCP calibra precio y analiza
+   competencia sobre el mercado agregado. Ninguno de los dos descubre oportunidades
+   nuevas abiertas hoy — si preguntan "¿qué hay abierto?", decirlo en vez de
+   responder con datos históricos.
 
 5. CONFIANZA: toda tool de precio devuelve `metodo_resolucion` y `confianza` (de
    resolver_producto) y muchas devuelven `n`/`muestra_insuficiente`. Repórtaselo
