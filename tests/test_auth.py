@@ -83,3 +83,36 @@ async def test_rechazo_queda_registrado_en_el_log(caplog: pytest.LogCaptureFixtu
             await client.post("/mcp")
     mensajes = [r.message for r in caplog.records]
     assert any("auth_rechazada" in m for m in mensajes)
+
+
+# --- token vía query param (?key=...) — claude.ai no ofrece un campo de ----
+# API key/header simple en su modal de conector personalizado, sólo OAuth
+# opcional. Sin esto, no hay forma de autenticar el conector desde esa UI.
+
+
+@pytest.mark.asyncio
+async def test_token_correcto_via_query_param_pasa():
+    async with await _cliente(_app_protegida()) as client:
+        resp = await client.post(f"/mcp?key={TOKEN}")
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_token_incorrecto_via_query_param_rechaza_401():
+    async with await _cliente(_app_protegida()) as client:
+        resp = await client.post("/mcp?key=token-equivocado")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_query_param_sin_key_rechaza_401():
+    async with await _cliente(_app_protegida()) as client:
+        resp = await client.post("/mcp?otraclave=valor")
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_header_sigue_funcionando_junto_con_soporte_de_query_param():
+    async with await _cliente(_app_protegida()) as client:
+        resp = await client.post("/mcp", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert resp.status_code == 200

@@ -40,24 +40,30 @@ Cuando uses el conector "mercado-publico-bioquimica":
    pesaron más).
 ```
 
-## 2. Registrar el conector (pasos esperados)
+## 2. Registrar el conector (verificado en vivo, 2026-08-06)
 
-⚠️ No pude verificar la UI exacta de claude.ai sin poder navegar ahí en este momento
-— confirmamos juntos el detalle cuando lleguemos a esta parte. La secuencia esperada:
+El modal "Agregar conector personalizado" de claude.ai sólo expone **OAuth Client
+ID** y **Secreto del cliente OAuth**, ambos opcionales — no hay un campo de tipo API
+key/header custom. Nuestro servidor usa un bearer token estático (HU-7.1), no OAuth,
+así que esos dos campos quedan **vacíos** y el token va **en la URL** en vez de un
+header (el middleware acepta ambas formas — ver `auth.py`).
 
 1. **claude.ai → Configuración → Conectores → Agregar conector personalizado.**
-2. **URL del servidor:** `https://<dominio-de-railway>.up.railway.app/mcp`
-   (el dominio real lo asigna Railway al desplegar — HU-7 del deploy).
-3. **Autenticación:** el servidor exige `Authorization: Bearer <MCP_AUTH_TOKEN>`
-   (HU-7.1). Si claude.ai permite un header personalizado o un campo "API key/token"
-   al agregar el conector, ahí va el mismo valor de `MCP_AUTH_TOKEN` configurado en
-   Railway. **Si claude.ai sólo ofrece OAuth para conectores remotos** (sin opción de
-   header estático), este esquema de auth no calzaría directo con esa UI — lo
-   evaluamos en el momento y, de ser necesario, se ajusta (opción más simple:
-   confirmar primero si soporta headers personalizados antes de descartarlo).
+2. **URL del servidor** — el dominio de Railway + `/mcp` + el token como query param:
+   ```
+   https://<dominio-de-railway>.up.railway.app/mcp?key=<MCP_AUTH_TOKEN>
+   ```
+   Ojo con el `/mcp` al final — sin eso, la URL apunta a la raíz del servicio, que no
+   responde el protocolo MCP.
+3. **OAuth Client ID / Secreto del cliente OAuth:** dejar ambos vacíos.
 4. Guardar y probar: pedirle a Claude que llame `verificar_estado` — debe devolver
    el RUT/código de proveedor de Bioquimica.cl (confirma que `identidad.toml` se
    leyó bien en el contenedor desplegado).
+
+**Trade-off consciente:** el token en la URL es más débil que en un header (puede
+quedar en logs de acceso, historial del navegador). Se aceptó porque la UI de
+conectores de claude.ai no ofrece otra vía sin construir OAuth real — ver el
+registro de la decisión en `auth.py` y en la conversación de despliegue.
 
 ## 3. Prueba de aceptación conversacional (5 preguntas)
 
