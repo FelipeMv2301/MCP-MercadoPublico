@@ -21,7 +21,31 @@ from mcp_mercadopublico.rut import dv_esperado, rut_valido
 logger = logging.getLogger(__name__)
 
 RAIZ_PROYECTO = Path(__file__).resolve().parents[2]
-RUTA_IDENTIDAD_DEFAULT = RAIZ_PROYECTO / "config" / "identidad.toml"
+
+
+def _resolver_ruta_identidad_default() -> Path:
+    """Ubica identidad.toml sin asumir instalación editable.
+
+    En desarrollo (pip install -e .), __file__ vive en <repo>/src/mcp_mercadopublico/
+    y RAIZ_PROYECTO cae correctamente en la raíz del repo. Con una instalación
+    NO editable (pip install . plano — el caso normal en un Dockerfile),
+    __file__ termina dentro de site-packages y RAIZ_PROYECTO/"config" apunta a
+    un lugar que no existe (verificado: cae en .../Lib/config/identidad.toml).
+    En ese caso, usar IDENTIDAD_TOML_PATH (override explícito) o el cwd del
+    proceso — en el contenedor, WORKDIR + `config/` copiado ahí lo resuelve.
+    """
+    candidato_editable = RAIZ_PROYECTO / "config" / "identidad.toml"
+    if candidato_editable.exists():
+        return candidato_editable
+
+    override = os.environ.get("IDENTIDAD_TOML_PATH")
+    if override:
+        return Path(override)
+
+    return Path.cwd() / "config" / "identidad.toml"
+
+
+RUTA_IDENTIDAD_DEFAULT = _resolver_ruta_identidad_default()
 
 
 # --------------------------------------------------------------------------
@@ -274,11 +298,16 @@ def get_settings() -> Settings:
         else Path(tempfile.gettempdir()) / "mcp_mercadopublico_scratch"
     )
 
+    # Railway inyecta PORT (no MCP_PORT) y espera que el proceso escuche ahí
+    # — tiene prioridad. MCP_PORT queda como override explícito para local/
+    # otros hosts; 8000 es el default sin ninguno de los dos.
+    puerto = os.environ.get("PORT") or os.environ.get("MCP_PORT", "8000")
+
     settings = Settings(
         identidad=identidad,
         mercado_publico_tickets=tickets,
         host=os.environ.get("MCP_HOST", "127.0.0.1"),
-        port=int(os.environ.get("MCP_PORT", "8000")),
+        port=int(puerto),
         log_dir=log_dir,
         data_dir=data_dir,
         manifest_path=data_dir / "manifest.sqlite",

@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.git/
+
+# Data lake, logs y scratch — nunca en la imagen, viven en el Volume/tmp en runtime
+data/
+logs/
+*.log
+*.db-journal
+
+# Tests y fixtures — no hacen falta en la imagen de producción
+tests/
+
+# Documentación — no hace falta en la imagen
+Backlog/
+docs/
+
+# Secretos
+.env
+*.zip

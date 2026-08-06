@@ -16,11 +16,14 @@ import logging
 
 import duckdb
 from mcp.server.mcpserver import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from mcp_mercadopublico import catalogo, inteligencia, precios
 from mcp_mercadopublico.config import get_settings
 from mcp_mercadopublico.formato.tsv_xml import filas_a_tsv_xml
 from mcp_mercadopublico.lake.etl import ingerir_periodo
+from mcp_mercadopublico.lake.manifest import listar_periodos
 from mcp_mercadopublico.lake.periodos import generar_periodos
 from mcp_mercadopublico.logging_setup import configurar_logging
 
@@ -45,6 +48,33 @@ mcp = MCPServer(
     name="mercado-publico-bioquimica",
     instructions=INSTRUCCIONES,
 )
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Healthcheck de Railway (HU-7.3) — sin autenticación por diseño, como
+    todo lo registrado vía custom_route(). No expone datos de negocio, sólo
+    si el servidor y el lake están en condiciones de responder."""
+    settings = get_settings()
+    lake_accesible = any(
+        (settings.data_dir / ds).exists() and any((settings.data_dir / ds).glob("**/*.parquet"))
+        for ds in ("oc", "lic", "cot")
+    )
+    ultimo_periodo = None
+    try:
+        registros = listar_periodos(settings.manifest_path)
+        if registros:
+            ultimo_periodo = max(r.ingerido_en for r in registros)
+    except Exception:
+        pass  # manifest inexistente todavía (antes de la primera ingesta) no es una falla de salud
+
+    return JSONResponse(
+        {
+            "servidor": "ok",
+            "lake_accesible": lake_accesible,
+            "ultima_ingesta": ultimo_periodo,
+        }
+    )
 
 
 @mcp.tool()
