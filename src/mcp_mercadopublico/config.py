@@ -7,6 +7,9 @@ rubros lo lee de aquí.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
 import os
 import tempfile
@@ -21,6 +24,12 @@ from mcp_mercadopublico.rut import dv_esperado, rut_valido
 logger = logging.getLogger(__name__)
 
 RAIZ_PROYECTO = Path(__file__).resolve().parents[2]
+
+# Default del Sheet de reportes por competidor — el que se compartió como
+# Editor con la service account. Override posible por GOOGLE_SHEET_ID (nivel
+# operación/deploy), pero NUNCA es un parámetro que las tools acepten del
+# modelo — el modelo no elige a qué spreadsheet escribir, sólo qué pestaña.
+GOOGLE_SHEET_ID_DEFAULT = "13lr6P1zrmRoUifPUu7tSuKhMBDKpQDY00Ks0wGkZbSY"
 
 
 def _resolver_ruta_identidad_default() -> Path:
@@ -232,6 +241,12 @@ class Settings(BaseModel):
     mcp_auth_token: str | None = None
     scheduler_habilitado: bool = False
     scheduler_intervalo_segundos: float = 6 * 60 * 60
+    google_credentials: dict | None = None
+    google_sheet_id: str | None = None
+
+    @property
+    def sheets_habilitado(self) -> bool:
+        return self.google_credentials is not None and self.google_sheet_id is not None
     # Deliberadamente FUERA de data_dir: el scratch de ingesta (ZIP + CSV
     # intermedios, hasta ~1,34 GB por periodo) no debe vivir en el Volume
     # persistente de Railway — se descarta al terminar cada periodo (HU-2.2,
@@ -267,6 +282,24 @@ class Settings(BaseModel):
         obligatorio MCP_AUTH_TOKEN. Correr en 127.0.0.1 (default local) no
         es alcanzable desde fuera de la máquina, así que no lo exige."""
         return self.host not in ("127.0.0.1", "localhost", "::1")
+
+
+def _cargar_google_credentials() -> dict | None:
+    """GOOGLE_CREDENTIALS trae el JSON de la service account en base64 (así
+    se pega entero en una sola línea de .env sin pelear con saltos de línea
+    dentro de private_key). Sin la variable, Sheets queda deshabilitado —
+    no es un requisito para el resto del MCP."""
+    crudo = os.environ.get("GOOGLE_CREDENTIALS")
+    if not crudo:
+        return None
+    try:
+        return json.loads(base64.b64decode(crudo))
+    except (binascii.Error, json.JSONDecodeError, ValueError):
+        logger.warning(
+            "google_credentials_invalida",
+            extra={"extra_fields": {"detalle": "GOOGLE_CREDENTIALS no es base64+JSON válido"}},
+        )
+        return None
 
 
 @lru_cache(maxsize=1)
@@ -315,6 +348,8 @@ def get_settings() -> Settings:
     scheduler_intervalo_segundos = float(
         os.environ.get("SCHEDULER_INTERVALO_SEGUNDOS", str(6 * 60 * 60))
     )
+    google_credentials = _cargar_google_credentials()
+    google_sheet_id = os.environ.get("GOOGLE_SHEET_ID") or GOOGLE_SHEET_ID_DEFAULT
 
     # Railway inyecta PORT (no MCP_PORT) y espera que el proceso escuche ahí
     # — tiene prioridad. MCP_PORT queda como override explícito para local/
@@ -335,6 +370,8 @@ def get_settings() -> Settings:
         mcp_auth_token=mcp_auth_token,
         scheduler_habilitado=scheduler_habilitado,
         scheduler_intervalo_segundos=scheduler_intervalo_segundos,
+        google_credentials=google_credentials,
+        google_sheet_id=google_sheet_id,
     )
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.data_dir.mkdir(parents=True, exist_ok=True)

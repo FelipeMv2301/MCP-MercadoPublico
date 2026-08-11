@@ -20,7 +20,7 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from mcp_mercadopublico import catalogo, inteligencia, precios
+from mcp_mercadopublico import catalogo, inteligencia, precios, sheets
 from mcp_mercadopublico.auth import AutenticacionBearerMiddleware
 from mcp_mercadopublico.config import get_settings
 from mcp_mercadopublico.formato.tsv_xml import filas_a_tsv_xml
@@ -637,6 +637,73 @@ def head_to_head(
             for c in cruces_pagina
         ],
     }
+
+
+@mcp.tool()
+def exportar_a_sheets(nombre_hoja: str, filas: list[dict]) -> dict:
+    """Anexa filas a una pestaña del Google Sheet de reportes de competencia,
+    visible para el equipo (no es el data lake — es un reporte satélite).
+
+    Convención: UNA PESTAÑA POR COMPETIDOR (usa su razón social o RUT como
+    `nombre_hoja`), y cada fila representa una LÍNEA de una licitación o
+    cotización, no el proceso completo — si un proceso tiene 5 líneas,
+    llama con 5 filas (o acumula con llamadas sucesivas). La pestaña se crea
+    sola si no existe. Llamadas sucesivas ACUMULAN (no pisan lo ya
+    reportado) — para ir agregando información a medida que se obtiene.
+
+    Todas las filas deben compartir las mismas llaves (se usan como
+    encabezado la primera vez que se escribe en la pestaña).
+
+    Args:
+        nombre_hoja: nombre de la pestaña — normalmente el competidor
+            (ej. razón social o RUT).
+        filas: lista de dicts, una por línea de licitación/cotización.
+    """
+    settings = get_settings()
+    if not settings.sheets_habilitado:
+        return {"error": "Google Sheets no está configurado (falta GOOGLE_CREDENTIALS)."}
+    if not filas:
+        return {"error": "filas está vacío — nada que exportar."}
+
+    try:
+        cliente = sheets.conectar(settings.google_credentials)
+        hoja = sheets.obtener_hoja(cliente, settings.google_sheet_id, nombre_hoja)
+        filas_escritas = sheets.agregar_filas(hoja, filas)
+    except Exception as exc:
+        logger.warning(
+            "sheets_exportar_fallo",
+            extra={"extra_fields": {"nombre_hoja": nombre_hoja, "error": str(exc)[:300]}},
+        )
+        return {"error": f"No se pudo escribir en Sheets: {exc}"}
+
+    return {"hoja": nombre_hoja, "filas_escritas": filas_escritas}
+
+
+@mcp.tool()
+def leer_sheets(nombre_hoja: str) -> dict:
+    """Lee lo ya reportado en una pestaña del Sheet de competencia (ver
+    exportar_a_sheets) — para analizar tendencias sobre lo acumulado en vez
+    de sólo lo último exportado.
+
+    Args:
+        nombre_hoja: nombre de la pestaña (competidor) a leer.
+    """
+    settings = get_settings()
+    if not settings.sheets_habilitado:
+        return {"error": "Google Sheets no está configurado (falta GOOGLE_CREDENTIALS)."}
+
+    try:
+        cliente = sheets.conectar(settings.google_credentials)
+        hoja = sheets.obtener_hoja(cliente, settings.google_sheet_id, nombre_hoja)
+        filas = sheets.leer_filas(hoja)
+    except Exception as exc:
+        logger.warning(
+            "sheets_leer_fallo",
+            extra={"extra_fields": {"nombre_hoja": nombre_hoja, "error": str(exc)[:300]}},
+        )
+        return {"error": f"No se pudo leer Sheets: {exc}"}
+
+    return {"hoja": nombre_hoja, "n_filas": len(filas), "filas": filas}
 
 
 def _resolver_para_precio(producto: str, settings) -> dict:
