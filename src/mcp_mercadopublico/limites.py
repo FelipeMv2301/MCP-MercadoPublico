@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import Callable, ParamSpec, TypeVar
+import threading
+from contextlib import contextmanager
+from typing import Callable, Iterator, ParamSpec, TypeVar
 
 import duckdb
 
@@ -26,6 +28,8 @@ logger = logging.getLogger(__name__)
 TIMEOUT_SEGUNDOS_DEFAULT = 10.0
 MAX_PERIODOS_POR_INGESTA = 36  # 3 años — una ingesta más larga se pide en tandas
 MAX_CRUCES_HEAD_TO_HEAD = 50  # head_to_head() no tenía límite propio (HU-7.2)
+LIMITE_MAXIMO_HEAD_TO_HEAD = 200  # tope duro del parámetro `limite` — evita que
+# un cliente pida una página gigante y vuelva a inundar el contexto del LLM.
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -65,3 +69,27 @@ def consultar(
                 ) from None
     finally:
         con.close()
+
+
+# --------------------------------------------------------------------------
+# Lock por periodo de ingesta — evita que dos ingestas del mismo
+# (dataset, periodo) corran a la vez y se pisen escribiendo el mismo
+# part.parquet. Server (tool manual) y scheduler (ciclo de fondo) corren en
+# el mismo proceso (ver scheduler.py) — un lock en memoria alcanza; no
+# protege entre réplicas/procesos distintos si algún día se escala así.
+# --------------------------------------------------------------------------
+
+_locks_periodo: dict[tuple[str, str], threading.Lock] = {}
+_locks_periodo_guardian = threading.Lock()
+
+
+@contextmanager
+def bloqueo_periodo(dataset: str, periodo: str) -> Iterator[None]:
+    """Serializa las ingestas de un mismo (dataset, periodo). Una segunda
+    llamada para la misma clave espera a que la primera termine en vez de
+    correr en paralelo y pisar el parquet/manifest del otro."""
+    clave = (dataset, periodo)
+    with _locks_periodo_guardian:
+        lock = _locks_periodo.setdefault(clave, threading.Lock())
+    with lock:
+        yield

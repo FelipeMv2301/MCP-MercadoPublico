@@ -552,7 +552,12 @@ def radar_competencia(
 
 
 @mcp.tool()
-def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
+def head_to_head(
+    rut_rival: str,
+    canal: str | None = None,
+    offset: int = 0,
+    limite: int = limites.MAX_CRUCES_HEAD_TO_HEAD,
+) -> dict:
     """Compara a Bioquimica.cl contra un competidor específico, proceso por
     proceso (licitación o cotización) donde AMBOS participaron: producto,
     precio de cada uno, diferencia %, quién ganó y el criterio declarado.
@@ -561,10 +566,24 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
     cruces (n bajo) la comparación es anecdótica, no un patrón. Esta tool lo
     advierte explícitamente para que no se presente como conclusión firme.
 
+    El array `cruces` viene paginado (orden estable por canal y código de
+    proceso). Si `hay_mas` es true, repetir la llamada con
+    offset += limite hasta que sea false para reconstruir el 100% de los
+    cruces.
+
     Args:
         rut_rival: RUT del competidor a comparar (formato con puntos y guion).
         canal: 'lic', 'cot' o None (ambos).
+        offset: cuántos cruces saltar desde el inicio (para paginar).
+        limite: cuántos cruces devolver como máximo (tope duro:
+            limites.LIMITE_MAXIMO_HEAD_TO_HEAD).
     """
+    if offset < 0:
+        return {"error": "offset debe ser >= 0."}
+    if limite <= 0:
+        return {"error": "limite debe ser > 0."}
+    limite = min(limite, limites.LIMITE_MAXIMO_HEAD_TO_HEAD)
+
     settings = get_settings()
     try:
         cruces = limites.consultar(
@@ -574,8 +593,10 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
     except limites.ConsultaExcedioTiempoLimite as exc:
         return {"error": str(exc)}
 
-    # Resumen sobre TODOS los cruces (no se pierde precisión); el detalle
-    # que se devuelve sí se acota — head_to_head() no traía límite propio.
+    # Resumen sobre TODOS los cruces (no se pierde precisión); sólo la página
+    # devuelta en `cruces` se acota. `inteligencia.head_to_head` ya entrega
+    # los cruces en orden estable (canal, codigo_proceso) — el slice de abajo
+    # no se solapa ni salta registros entre llamadas con distinto offset.
     n_cruces = len(cruces)
     ganados = sum(1 for c in cruces if c.ganador == "nosotros")
     diferencias = sorted(c.diferencia_pct for c in cruces if c.diferencia_pct is not None)
@@ -589,8 +610,8 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
             f"Sólo {n_cruces} cruce(s) encontrados: tratar como anécdota, no como patrón."
         )
 
-    truncado = n_cruces > limites.MAX_CRUCES_HEAD_TO_HEAD
-    cruces_mostrados = cruces[: limites.MAX_CRUCES_HEAD_TO_HEAD] if truncado else cruces
+    cruces_pagina = cruces[offset : offset + limite]
+    hay_mas = offset + limite < n_cruces
 
     return {
         "rut_rival": rut_rival,
@@ -600,7 +621,8 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
             "diferencia_pct_mediana": diferencia_mediana,
             "advertencia": advertencia,
         },
-        "cruces_truncados": truncado,
+        "total_cruces": n_cruces,
+        "hay_mas": hay_mas,
         "cruces": [
             {
                 "canal": c.canal,
@@ -612,7 +634,7 @@ def head_to_head(rut_rival: str, canal: str | None = None) -> dict:
                 "ganador": c.ganador,
                 "criterio": c.criterio,
             }
-            for c in cruces_mostrados
+            for c in cruces_pagina
         ],
     }
 

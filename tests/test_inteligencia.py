@@ -411,3 +411,77 @@ def test_head_to_head_ganamos_nosotros(con, tmp_path: Path):
 
 def test_head_to_head_lake_vacio(con, tmp_path: Path):
     assert intel.head_to_head(con, tmp_path / "data", BIOQUIMICA, RIVAL_1) == []
+
+
+def test_head_to_head_orden_estable_por_canal_y_codigo_proceso(con, tmp_path: Path):
+    """server.py pagina por offset sobre esta lista — si el orden dependiera
+    del scan del parquet (no determinístico), offsets sucesivos podrían
+    solaparse o saltarse cruces. Se insertan códigos fuera de orden y en
+    particiones (meses/canales) distintas para no depender de que el orden
+    de scan coincida por casualidad con el alfabético."""
+    data_dir = tmp_path / "data"
+    _particion_lic(
+        con, data_dir, 2026, 6,
+        [
+            {"codigo_externo": "P3", "rut_proveedor": BIOQUIMICA, "razon_social_proveedor": "Bioquimica",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 100, "oferta_seleccionada": "Seleccionada",
+             "criterios_evaluacion": "precio"},
+            {"codigo_externo": "P3", "rut_proveedor": RIVAL_1, "razon_social_proveedor": "Rival Uno",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 110, "oferta_seleccionada": "No Seleccionada",
+             "criterios_evaluacion": "precio"},
+        ],
+    )
+    _particion_lic(
+        con, data_dir, 2026, 5,
+        [
+            {"codigo_externo": "P1", "rut_proveedor": BIOQUIMICA, "razon_social_proveedor": "Bioquimica",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 100, "oferta_seleccionada": "Seleccionada",
+             "criterios_evaluacion": "precio"},
+            {"codigo_externo": "P1", "rut_proveedor": RIVAL_1, "razon_social_proveedor": "Rival Uno",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 110, "oferta_seleccionada": "No Seleccionada",
+             "criterios_evaluacion": "precio"},
+        ],
+    )
+    _particion_cot(
+        con, data_dir, 2026, 6,
+        [
+            {"codigo_cotizacion": "P2", "rutproveedor": BIOQUIMICA, "razon_social_proveedor": "Bioquimica",
+             "nombre_producto_generico": "x", "monto_total": 100, "proveedor_seleccionado": "si",
+             "nombre_criterio": "precio", "tamano": "MiPyme"},
+            {"codigo_cotizacion": "P2", "rutproveedor": RIVAL_1, "razon_social_proveedor": "Rival Uno",
+             "nombre_producto_generico": "x", "monto_total": 110, "proveedor_seleccionado": "no",
+             "nombre_criterio": "precio", "tamano": "MiPyme"},
+        ],
+    )
+
+    cruces = intel.head_to_head(con, data_dir, BIOQUIMICA, RIVAL_1)
+
+    assert [(c.canal, c.codigo_proceso) for c in cruces] == [
+        ("cot", "P2"), ("lic", "P1"), ("lic", "P3"),
+    ]
+
+
+def test_head_to_head_orden_es_repetible_entre_llamadas(con, tmp_path: Path):
+    """Mismo dataset, dos llamadas seguidas: el orden debe ser idéntico
+    (paginación por offset no tolera un orden que cambie entre llamadas)."""
+    data_dir = tmp_path / "data"
+    filas = []
+    for i in range(20):
+        codigo = f"P{i:03d}"
+        filas.append(
+            {"codigo_externo": codigo, "rut_proveedor": BIOQUIMICA, "razon_social_proveedor": "Bioquimica",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 100, "oferta_seleccionada": "Seleccionada",
+             "criterios_evaluacion": "precio"}
+        )
+        filas.append(
+            {"codigo_externo": codigo, "rut_proveedor": RIVAL_1, "razon_social_proveedor": "Rival Uno",
+             "nombre_producto_genrico": "x", "valor_total_ofertado": 110, "oferta_seleccionada": "No Seleccionada",
+             "criterios_evaluacion": "precio"}
+        )
+    _particion_lic(con, data_dir, 2026, 6, filas)
+
+    primera = [c.codigo_proceso for c in intel.head_to_head(con, data_dir, BIOQUIMICA, RIVAL_1)]
+    segunda = [c.codigo_proceso for c in intel.head_to_head(con, data_dir, BIOQUIMICA, RIVAL_1)]
+
+    assert primera == segunda
+    assert primera == sorted(primera)

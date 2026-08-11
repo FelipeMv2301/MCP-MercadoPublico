@@ -23,6 +23,7 @@ from mcp_mercadopublico.lake.columnas import (
     a_snake_case,
     renombrar_columnas,
 )
+from mcp_mercadopublico import limites
 from mcp_mercadopublico.lake.descarga import Dataset, descargar_periodo
 from mcp_mercadopublico.lake.extraccion import extraer_csv_utf8
 from mcp_mercadopublico.lake.manifest import obtener_periodo, registrar_periodo
@@ -327,75 +328,80 @@ def ingerir_periodo(
     nombre de archivo) y su fila en el manifest — seguro de volver a llamar.
     El scratch se limpia siempre (éxito o excepción), nunca deja el ZIP ni
     los CSV intermedios ocupando disco entre ingestas.
+
+    Serializado por (dataset, periodo) (ver limites.bloqueo_periodo): sin
+    esto, dos llamadas concurrentes al mismo periodo (ej. el scheduler de
+    fondo y una ingesta manual) escribirían al mismo part.parquet a la vez.
     """
     periodo = f"{anio}-{mes}"
-    registro_previo = obtener_periodo(manifest_path, dataset, periodo)
-    etag_previo = registro_previo.etag if registro_previo else None
+    with limites.bloqueo_periodo(dataset, periodo):
+        registro_previo = obtener_periodo(manifest_path, dataset, periodo)
+        etag_previo = registro_previo.etag if registro_previo else None
 
-    scratch_periodo = scratch_dir / f"{dataset}_{anio}_{mes}"
+        scratch_periodo = scratch_dir / f"{dataset}_{anio}_{mes}"
 
-    try:
-        resultado_descarga = descargar_periodo(
-            dataset, anio, mes, scratch_periodo, etag_previo=etag_previo
+        try:
+            resultado_descarga = descargar_periodo(
+                dataset, anio, mes, scratch_periodo, etag_previo=etag_previo
+            )
+
+            if resultado_descarga.estado == "no_publicado":
+                return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="no_publicado")
+
+            if resultado_descarga.estado == "sin_cambios":
+                return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="sin_cambios")
+
+            con = duckdb.connect()
+            try:
+                rutas_csv = extraer_csv_utf8(resultado_descarga.ruta, scratch_periodo / "extraido")
+
+                whitelist_onu = (
+                    whitelist_codigos_onu_vigente(con, data_dir) if dataset == "cot" else None
+                )
+
+                filas_leidas, filas_escritas, ruta_parquet = transformar_y_escribir(
+                    con,
+                    dataset,
+                    rutas_csv,
+                    anio,
+                    mes,
+                    data_dir,
+                    rubros_permitidos=rubros_permitidos,
+                    whitelist_onu=whitelist_onu,
+                )
+            finally:
+                con.close()
+        finally:
+            shutil.rmtree(scratch_periodo, ignore_errors=True)
+
+        filas_descartadas = filas_leidas - filas_escritas
+        registrar_periodo(
+            manifest_path,
+            dataset=dataset,
+            periodo=periodo,
+            etag=resultado_descarga.etag,
+            last_modified=resultado_descarga.last_modified,
+            filas_leidas=filas_leidas,
+            filas_escritas=filas_escritas,
+            filas_descartadas=filas_descartadas,
+            estado="ingerido",
+        )
+        log_evento_etl(
+            logger,
+            dataset=dataset,
+            periodo=periodo,
+            filas_leidas=filas_leidas,
+            filas_escritas=filas_escritas,
+            filas_descartadas=filas_descartadas,
+            motivo_descarte="fuera de rubros/whitelist configurados",
         )
 
-        if resultado_descarga.estado == "no_publicado":
-            return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="no_publicado")
-
-        if resultado_descarga.estado == "sin_cambios":
-            return ResultadoIngesta(dataset=dataset, periodo=periodo, estado="sin_cambios")
-
-        con = duckdb.connect()
-        try:
-            rutas_csv = extraer_csv_utf8(resultado_descarga.ruta, scratch_periodo / "extraido")
-
-            whitelist_onu = (
-                whitelist_codigos_onu_vigente(con, data_dir) if dataset == "cot" else None
-            )
-
-            filas_leidas, filas_escritas, ruta_parquet = transformar_y_escribir(
-                con,
-                dataset,
-                rutas_csv,
-                anio,
-                mes,
-                data_dir,
-                rubros_permitidos=rubros_permitidos,
-                whitelist_onu=whitelist_onu,
-            )
-        finally:
-            con.close()
-    finally:
-        shutil.rmtree(scratch_periodo, ignore_errors=True)
-
-    filas_descartadas = filas_leidas - filas_escritas
-    registrar_periodo(
-        manifest_path,
-        dataset=dataset,
-        periodo=periodo,
-        etag=resultado_descarga.etag,
-        last_modified=resultado_descarga.last_modified,
-        filas_leidas=filas_leidas,
-        filas_escritas=filas_escritas,
-        filas_descartadas=filas_descartadas,
-        estado="ingerido",
-    )
-    log_evento_etl(
-        logger,
-        dataset=dataset,
-        periodo=periodo,
-        filas_leidas=filas_leidas,
-        filas_escritas=filas_escritas,
-        filas_descartadas=filas_descartadas,
-        motivo_descarte="fuera de rubros/whitelist configurados",
-    )
-
-    return ResultadoIngesta(
-        dataset=dataset,
-        periodo=periodo,
-        estado="ingerido",
-        filas_leidas=filas_leidas,
-        filas_escritas=filas_escritas,
-        filas_descartadas=filas_descartadas,
-        ruta_parquet=ruta_parquet,
-    )
+        return ResultadoIngesta(
+            dataset=dataset,
+            periodo=periodo,
+            estado="ingerido",
+            filas_leidas=filas_leidas,
+            filas_escritas=filas_escritas,
+            filas_descartadas=filas_descartadas,
+            ruta_parquet=ruta_parquet,
+        )

@@ -505,4 +505,7 @@ def head_to_head(
                 )
             )
 
-    return cruces
+    # Orden estable y determinístico: sin esto, la paginación por offset en
+    # server.py podría solapar o saltarse registros entre llamadas (el orden
+    # de por_proceso sigue el scan del parquet, que no está garantizado).
+    return sorted(cruces, key=lambda c: (c.canal, c.codigo_proceso))
