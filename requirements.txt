@@ -5,6 +5,8 @@ duckdb>=1.0
 pyarrow>=17
 pandas>=2.2
 tenacity>=8.2
+gspread>=6.1
+google-auth>=2.34
 
 # dev / tests
 pytest>=8

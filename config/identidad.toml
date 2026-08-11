@@ -271,3 +271,5 @@ metodo_correcto = "descubrir rivales por co-participación en licitación/cotiza
 # 'Estructuras prefabricadas' (las 'Unidades de laboratorio' del catálogo).
 # Agregar ese RubroN1 al filtro de ingesta.
 rubro_n1_faltante = "Artículos para estructuras (subrubro: Estructuras prefabricadas)"
+
+
