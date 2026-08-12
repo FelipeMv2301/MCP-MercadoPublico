@@ -102,6 +102,33 @@ COLUMNA_MONEDA = {
     "cot": "moneda",
 }
 
+# Valor de esa columna que significa "es pesos chilenos" — NO es el mismo
+# literal en los tres datasets (bug real encontrado en producción,
+# 2026-08-11): OC/COT usan el código ISO ('CLP'), pero LIC trae el nombre en
+# español ('Peso Chileno' en el 99,8% de las filas verificadas contra el
+# lake real) y NUNCA el string 'CLP' — comparar contra 'CLP' fijo dejaba
+# es_clp en false para el 99,996% de las filas de licitación, silenciando
+# benchmark_precio/precio_para_ganar/criterios_que_deciden para ese canal
+# sin ningún error visible.
+VALOR_MONEDA_CLP = {
+    "oc": "CLP",
+    "lic": "Peso Chileno",
+    "cot": "CLP",
+}
+
+# Valores conocidos y legítimos de la columna de moneda de cada dataset —
+# verificado contra el lake real desplegado (2026-08-11). Se usa SÓLO para
+# detectar corrupción del camino tolerante de _leer_csv (ver etl.py): una
+# línea malformada con columnas desplazadas puede "sobrevivir" con texto
+# arbitrario en esta columna (nombres de archivo, RUT, fechas — visto en
+# lic-da/2026-3) sin que el conteo de filas lo detecte. NO es un filtro de
+# negocio ni se usa para calcular es_clp (eso es VALOR_MONEDA_CLP).
+VALORES_MONEDA_VALIDOS = {
+    "oc": frozenset({"CLP", "USD", "CLF", "UTM", "EUR"}),
+    "lic": frozenset({"Peso Chileno", "Dolar", "Unidad de Fomento", "Moneda revisar", "Aceptada"}),
+    "cot": frozenset({"CLP", "USD", "CLF", "UTM", "EUR"}),
+}
+
 # COT no tiene columna de rubro — ver lake/etl.py para cómo se filtra
 # (whitelist de codigoProductoONU derivada de OC+LIC).
 COLUMNA_RUBRO_N1 = {

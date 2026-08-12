@@ -186,6 +186,7 @@ def ingerir_datos_abiertos(
     dataset: str,
     periodo_desde: str | None = None,
     periodo_hasta: str | None = None,
+    forzar: bool = False,
 ) -> dict:
     """Descarga e ingiere al data lake los periodos de Datos Abiertos de
     ChileCompra para un dataset ('oc', 'lic' o 'cot').
@@ -214,6 +215,11 @@ def ingerir_datos_abiertos(
                        el configurado en identidad.toml.
         periodo_hasta: 'AAAA-M' sin cero-padding (ej. '2026-8'). Por defecto,
                        el configurado en identidad.toml.
+        forzar: True para descargar y reprocesar aunque ChileCompra no haya
+                cambiado el archivo (ETag igual). Necesario para que un fix
+                del pipeline de transformación (ej. deduplicación, es_clp)
+                llegue a periodos ya ingeridos — sin esto, el ETag hace que
+                se salten enteros con código nuevo o no.
     """
     if dataset not in ("oc", "lic", "cot"):
         return {"error": f"dataset {dataset!r} inválido — usar 'oc', 'lic' o 'cot'"}
@@ -254,6 +260,7 @@ def ingerir_datos_abiertos(
                 manifest_path=settings.manifest_path,
                 scratch_dir=settings.scratch_dir,
                 rubros_permitidos=rubros_permitidos,
+                forzar=forzar,
             )
             resultados.append(
                 {

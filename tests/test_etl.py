@@ -91,6 +91,55 @@ def test_es_clp_marca_moneda_distinta_de_clp(con, tmp_path: Path):
     assert dict(filas) == {"1": True, "3": False}
 
 
+def test_es_clp_lic_reconoce_peso_chileno_no_el_codigo_iso(con, tmp_path: Path):
+    """Bug real encontrado en producción (2026-08-11, lake ya desplegado):
+    LIC trae el nombre en español ('Peso Chileno'), nunca el código ISO
+    'CLP' que sí usan OC/COT — comparar contra 'CLP' fijo dejaba es_clp en
+    false para el 99,996% de las filas de licitación, silenciando
+    benchmark_precio/precio_para_ganar/criterios_que_deciden para ese canal
+    (ver VALOR_MONEDA_CLP en columnas.py)."""
+    contenido = (
+        "Codigo;Rubro1;CodigoProductoONU;Moneda de la Oferta\n"
+        '1;"Equipamiento para laboratorios";41116007;Peso Chileno\n'
+        '2;"Equipamiento para laboratorios";41116007;Dolar\n'
+    )
+    csv_path = tmp_path / "lic_2026-6.csv"
+    csv_path.write_text(contenido, encoding="utf-8", newline="")
+    data_dir = tmp_path / "data"
+
+    _, _, ruta_parquet = etl.transformar_y_escribir(
+        con, "lic", [csv_path], 2026, 6, data_dir,
+        rubros_permitidos=["Equipamiento para laboratorios"],
+    )
+
+    filas = con.execute(
+        f"SELECT codigo, es_clp FROM read_parquet('{ruta_parquet.as_posix()}') ORDER BY codigo"
+    ).fetchall()
+    assert dict(filas) == {"1": True, "2": False}
+
+
+def test_es_clp_cot_sigue_comparando_contra_el_codigo_iso(con, tmp_path: Path):
+    """OC/COT no cambian de comportamiento con el fix — siguen comparando
+    contra el código ISO 'CLP', no el nombre en español."""
+    contenido = (
+        "CodigoCotizacion;CodigoProducto;MontoTotal;moneda\n"
+        "1;41116007;100,0;CLP\n"
+        "2;41116007;100,0;Dolar\n"
+    )
+    csv_path = tmp_path / "cot_2026-6.csv"
+    csv_path.write_text(contenido, encoding="utf-8", newline="")
+    data_dir = tmp_path / "data"
+
+    _, _, ruta_parquet = etl.transformar_y_escribir(
+        con, "cot", [csv_path], 2026, 6, data_dir, whitelist_onu=["41116007"],
+    )
+
+    filas = con.execute(
+        f"SELECT codigo_cotizacion, es_clp FROM read_parquet('{ruta_parquet.as_posix()}') ORDER BY codigo_cotizacion"
+    ).fetchall()
+    assert dict(filas) == {"1": True, "2": False}
+
+
 def test_na_y_sentinela_fecha_se_convierten_a_null(con, tmp_path: Path):
     csv_path = _csv_oc_sintetico(tmp_path / "2026-6.csv")
     data_dir = tmp_path / "data"
@@ -126,6 +175,122 @@ def test_filtro_rubro_es_case_insensitive(con, tmp_path: Path):
 
     assert filas_leidas == 2
     assert filas_escritas == 1  # matchea pese a la diferencia de casing
+
+
+def test_filas_duplicadas_se_deduplican_y_se_registra_el_delta(
+    con, tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    """Hallazgo real contra el lake desplegado (2026-08-11): ChileCompra
+    publica líneas 100% idénticas en su CSV fuente (~3,8% de COT medido) —
+    no es un bug de extracción propio. Se deduplican al escribir, y el
+    delta se loggea (nunca se pierde/gana data en silencio)."""
+    import logging
+
+    contenido = (
+        "ID;RubroN1;codigoProductoONU;precioNeto;monedaItem;cantidad;FechaCancelacion\n"
+        '1;"Equipamiento para laboratorios";41116007;"19977,72";CLP;3;NA\n'
+        '1;"Equipamiento para laboratorios";41116007;"19977,72";CLP;3;NA\n'  # duplicado exacto
+        '2;"Equipamiento para laboratorios";25101602;"500,0";CLP;1;NA\n'
+    )
+    csv_path = tmp_path / "2026-6.csv"
+    csv_path.write_text(contenido, encoding="utf-8", newline="")
+    data_dir = tmp_path / "data"
+
+    with caplog.at_level(logging.WARNING, logger="mcp_mercadopublico.lake.etl"):
+        filas_leidas, filas_escritas, ruta_parquet = etl.transformar_y_escribir(
+            con, "oc", [csv_path], 2026, 6, data_dir,
+            rubros_permitidos=["Equipamiento para laboratorios"],
+        )
+
+    assert filas_leidas == 3  # las 3 filas del CSV, duplicado incluido
+    assert filas_escritas == 2  # el duplicado se descarta al escribir
+
+    filas = con.execute(
+        f"SELECT id FROM read_parquet('{ruta_parquet.as_posix()}') ORDER BY id"
+    ).fetchall()
+    assert [f[0] for f in filas] == ["1", "2"]  # no quedan dos "1"
+
+    mensajes = [r.message for r in caplog.records]
+    assert any("filas_duplicadas_descartadas" in m for m in mensajes)
+
+
+def test_filas_sin_duplicados_no_generan_warning(con, tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    import logging
+
+    csv_path = _csv_oc_sintetico(tmp_path / "2026-6.csv")
+    data_dir = tmp_path / "data"
+
+    with caplog.at_level(logging.WARNING, logger="mcp_mercadopublico.lake.etl"):
+        etl.transformar_y_escribir(
+            con, "oc", [csv_path], 2026, 6, data_dir,
+            rubros_permitidos=["Equipamiento para laboratorios"],
+        )
+
+    mensajes = [r.message for r in caplog.records]
+    assert not any("filas_duplicadas_descartadas" in m for m in mensajes)
+
+
+# --- _descartar_filas_moneda_no_reconocida (corrupción del camino tolerante) --
+
+
+def test_descartar_filas_moneda_no_reconocida_saca_filas_corruptas(
+    con, caplog: pytest.LogCaptureFixture
+):
+    """Simula lo que dejó lic-da/2026-3: una fila con texto arbitrario en la
+    columna de moneda (columnas desplazadas por el camino tolerante) — se
+    descarta en vez de dejar el dato corrupto, y se loggea el conteo."""
+    import logging
+
+    con.execute(
+        """
+        CREATE TABLE relacion AS SELECT * FROM (VALUES
+            (1, 'Peso Chileno'),
+            (2, 'Ficha técnica 235.pdf'),
+            (3, 'Dolar')
+        ) AS v(id, "Moneda de la Oferta")
+        """
+    )
+    relacion = con.table("relacion")
+
+    with caplog.at_level(logging.WARNING, logger="mcp_mercadopublico.lake.etl"):
+        resultado = etl._descartar_filas_moneda_no_reconocida(con, relacion, "lic", 2026, 3)
+
+    filas = con.execute("SELECT id FROM resultado ORDER BY id").fetchall()
+    assert [f[0] for f in filas] == [1, 3]  # la fila 2 (corrupta) se descarta
+
+    mensajes = [r.message for r in caplog.records]
+    assert any("csv_filas_con_moneda_no_reconocida_tras_camino_tolerante" in m for m in mensajes)
+
+
+def test_descartar_filas_moneda_no_reconocida_no_toca_nulos(con):
+    """Un valor NULL de moneda es dato faltante, no corrupción — no debe
+    descartarse por este chequeo (es un problema distinto, ya cubierto por
+    NULLIF de NA/vacío en _expresion_columna)."""
+    con.execute(
+        """
+        CREATE TABLE relacion AS SELECT * FROM (VALUES
+            (1, 'Peso Chileno'),
+            (2, NULL)
+        ) AS v(id, "Moneda de la Oferta")
+        """
+    )
+    relacion = con.table("relacion")
+
+    resultado = etl._descartar_filas_moneda_no_reconocida(con, relacion, "lic", 2026, 3)
+
+    filas = con.execute("SELECT id FROM resultado ORDER BY id").fetchall()
+    assert [f[0] for f in filas] == [1, 2]
+
+
+def test_descartar_filas_moneda_no_reconocida_sin_columna_moneda_no_hace_nada(con):
+    """Si la relación no tiene la columna de moneda (caso defensivo, no
+    debería pasar con los datasets reales), no debe fallar — pasa igual."""
+    con.execute("CREATE TABLE relacion AS SELECT * FROM (VALUES (1), (2)) AS v(id)")
+    relacion = con.table("relacion")
+
+    resultado = etl._descartar_filas_moneda_no_reconocida(con, relacion, "lic", 2026, 3)
+
+    assert con.execute("SELECT COUNT(*) FROM resultado").fetchone()[0] == 2
 
 
 def test_csv_malformado_usa_camino_tolerante_y_avisa(
@@ -362,3 +527,50 @@ def test_ingerir_periodo_sin_cambios_no_reprocesa(tmp_path: Path, monkeypatch: p
 
     assert resultado.estado == "sin_cambios"
     assert llamadas["n"] == 1
+
+
+def test_ingerir_periodo_forzar_ignora_el_etag_guardado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """forzar=True es lo que hace falta para que un fix de transformar_y_escribir
+    (es_clp, deduplicación) llegue a un periodo ya ingerido cuyo archivo en
+    ChileCompra no cambió — sin esto, el ETag guardado devuelve 'sin_cambios'
+    y el periodo se salta entero con código nuevo o no."""
+    from mcp_mercadopublico.lake.descarga import ResultadoDescarga
+    from mcp_mercadopublico.lake.manifest import registrar_periodo
+    import zipfile
+
+    registrar_periodo(
+        tmp_path / "manifest.sqlite", dataset="oc", periodo="2026-6",
+        etag='"ya-tengo-esta"', last_modified=None,
+        filas_leidas=10, filas_escritas=5, filas_descartadas=5, estado="ingerido",
+    )
+
+    llamadas = {"n": 0}
+
+    def descarga_falsa(dataset, anio, mes, destino_dir, etag_previo=None, **kw):
+        llamadas["n"] += 1
+        assert etag_previo is None  # forzar=True no debe pasar el etag guardado
+        destino_dir.mkdir(parents=True, exist_ok=True)
+        zip_path = destino_dir / "2026-6.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr(
+                "2026-6.csv",
+                (
+                    "ID;RubroN1;codigoProductoONU;precioNeto;monedaItem\n"
+                    '1;"Equipamiento para laboratorios";41116007;"100,0";CLP\n'
+                ).encode("latin-1"),
+            )
+        return ResultadoDescarga(estado="descargado", ruta=zip_path, etag='"etag-nuevo"')
+
+    monkeypatch.setattr(etl, "descargar_periodo", descarga_falsa)
+
+    resultado = etl.ingerir_periodo(
+        "oc", 2026, 6,
+        data_dir=tmp_path / "data", manifest_path=tmp_path / "manifest.sqlite",
+        scratch_dir=tmp_path / "scratch", rubros_permitidos=["Equipamiento para laboratorios"],
+        forzar=True,
+    )
+
+    assert resultado.estado == "ingerido"  # se reprocesó, no "sin_cambios"
+    assert llamadas["n"] == 1
+    registro = obtener_periodo(tmp_path / "manifest.sqlite", "oc", "2026-6")
+    assert registro.etag == '"etag-nuevo"'

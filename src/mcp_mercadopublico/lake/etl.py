@@ -20,6 +20,8 @@ from mcp_mercadopublico.lake.columnas import (
     COLUMNA_MONEDA,
     COLUMNA_RUBRO_N1,
     COLUMNAS_NUMERICAS,
+    VALOR_MONEDA_CLP,
+    VALORES_MONEDA_VALIDOS,
     a_snake_case,
     renombrar_columnas,
 )
@@ -75,9 +77,16 @@ def _construir_proyeccion(columnas_originales: list[str], mapa: dict[str, str], 
 
     # P15: precioNeto/MontoUnitarioOferta/MontoTotal no siempre son CLP.
     # es_clp deja explícito el filtro que toda tool de precios debe aplicar.
+    # El literal que significa "es CLP" NO es el mismo en los tres datasets
+    # (OC/COT traen el código ISO, LIC el nombre en español) — ver
+    # VALOR_MONEDA_CLP; comparar contra 'CLP' fijo dejaba es_clp siempre en
+    # false para LIC (bug real encontrado en producción, 2026-08-11).
     moneda_original = COLUMNA_MONEDA[dataset]
     moneda_snake = mapa[moneda_original]
-    piezas.append(f"({_escapar_identificador(moneda_snake)} = 'CLP') AS es_clp")
+    valor_clp = VALOR_MONEDA_CLP[dataset].replace("'", "''")
+    piezas.append(
+        f"(UPPER(TRIM({_escapar_identificador(moneda_snake)})) = UPPER('{valor_clp}')) AS es_clp"
+    )
 
     return ", ".join(piezas)
 
@@ -260,7 +269,59 @@ def _leer_csv(
             },
         )
 
-    return relacion
+    return _descartar_filas_moneda_no_reconocida(con, relacion, dataset, anio, mes)
+
+
+def _descartar_filas_moneda_no_reconocida(
+    con: duckdb.DuckDBPyConnection,
+    relacion: duckdb.DuckDBPyRelation,
+    dataset: str,
+    anio: int,
+    mes: int,
+) -> duckdb.DuckDBPyRelation:
+    """El camino tolerante (ignore_errors=True) puede 'rescatar' una línea
+    malformada con las columnas desplazadas en vez de descartarla — el
+    conteo de filas (filas_python vs filas_duckdb, más arriba) no detecta
+    esto porque la fila sigue existiendo, sólo con datos corruptos.
+
+    Bug real (lic-da/2026-3): ~25 filas quedaron con texto arbitrario
+    (nombre de archivo, RUT, fecha) en la columna de moneda. Se valida esa
+    columna contra los valores conocidos del dataset (VALORES_MONEDA_VALIDOS)
+    y se descarta la fila si no calza — no se intenta "corregir" el
+    desplazamiento, no hay forma confiable de saber a qué columna real
+    pertenecía cada valor."""
+    moneda_col = COLUMNA_MONEDA[dataset]
+    if moneda_col not in relacion.columns:
+        return relacion
+
+    ident = _escapar_identificador(moneda_col)
+    lista_sql = ", ".join(f"'{v}'" for v in VALORES_MONEDA_VALIDOS[dataset])
+    condicion_valida = f"{ident} IS NULL OR {ident} IN ({lista_sql})"
+
+    total = con.execute("SELECT COUNT(*) FROM relacion").fetchone()[0]
+    validas = con.execute(f"SELECT COUNT(*) FROM relacion WHERE {condicion_valida}").fetchone()[0]
+    invalidas = total - validas
+
+    if invalidas == 0:
+        return relacion
+
+    logger.warning(
+        "csv_filas_con_moneda_no_reconocida_tras_camino_tolerante",
+        extra={
+            "extra_fields": {
+                "dataset": dataset,
+                "periodo": f"{anio}-{mes}",
+                "columna": moneda_col,
+                "filas_descartadas": invalidas,
+                "detalle": (
+                    "Valor de moneda no reconocido tras el camino tolerante — probable "
+                    "desplazamiento de columnas en una línea malformada; se descarta la "
+                    "fila en vez de dejar el dato corrupto."
+                ),
+            }
+        },
+    )
+    return con.sql(f"SELECT * FROM relacion WHERE {condicion_valida}")
 
 
 def transformar_y_escribir(
@@ -294,10 +355,33 @@ def transformar_y_escribir(
         f"SELECT {proyeccion} FROM rel_origen WHERE {where_sql}", params=params
     )
 
+    # ChileCompra publica líneas 100% idénticas en su CSV fuente (verificado
+    # contra el lake real, 2026-08-11: ~3,8% de las filas de COT) — no es un
+    # bug de extracción propio, se deduplica al escribir. DISTINCT sobre
+    # todas las columnas: dos líneas de producto distinto de un mismo
+    # proceso NUNCA son iguales en todas las columnas a la vez, así que esto
+    # no puede confundir líneas legítimas con duplicados.
+    rel_deduplicada = con.sql("SELECT DISTINCT * FROM rel_filtrada")
+    filas_tras_filtro = con.execute("SELECT COUNT(*) FROM rel_filtrada").fetchone()[0]
+    filas_unicas = con.execute("SELECT COUNT(*) FROM rel_deduplicada").fetchone()[0]
+    duplicadas = filas_tras_filtro - filas_unicas
+    if duplicadas > 0:
+        logger.warning(
+            "filas_duplicadas_descartadas",
+            extra={
+                "extra_fields": {
+                    "dataset": dataset,
+                    "periodo": f"{anio}-{mes}",
+                    "duplicadas": duplicadas,
+                    "pct_duplicado": round(100 * duplicadas / max(filas_tras_filtro, 1), 3),
+                }
+            },
+        )
+
     destino_dir = data_dir / dataset / f"anio={anio}" / f"mes={mes}"
     destino_dir.mkdir(parents=True, exist_ok=True)
     ruta_parquet = destino_dir / "part.parquet"
-    rel_filtrada.write_parquet(str(ruta_parquet), compression="zstd")
+    rel_deduplicada.write_parquet(str(ruta_parquet), compression="zstd")
 
     filas_escritas = con.execute(
         f"SELECT COUNT(*) FROM read_parquet('{ruta_parquet.as_posix()}')"
@@ -320,6 +404,7 @@ def ingerir_periodo(
     manifest_path: Path,
     scratch_dir: Path,
     rubros_permitidos: list[str] | None = None,
+    forzar: bool = False,
 ) -> ResultadoIngesta:
     """Pipeline de un periodo: manifest -> descarga condicional -> extracción
     -> transform -> Parquet -> actualizar manifest -> limpiar scratch.
@@ -332,10 +417,16 @@ def ingerir_periodo(
     Serializado por (dataset, periodo) (ver limites.bloqueo_periodo): sin
     esto, dos llamadas concurrentes al mismo periodo (ej. el scheduler de
     fondo y una ingesta manual) escribirían al mismo part.parquet a la vez.
+
+    `forzar=True` ignora el ETag guardado y siempre descarga/reprocesa —
+    necesario para que un fix de transformar_y_escribir (ej. es_clp,
+    deduplicación) llegue a periodos YA ingeridos: si el archivo de
+    ChileCompra no cambió, el ETag hace que el servidor responda 304 y el
+    periodo se salte entero, código nuevo o no.
     """
     periodo = f"{anio}-{mes}"
     with limites.bloqueo_periodo(dataset, periodo):
-        registro_previo = obtener_periodo(manifest_path, dataset, periodo)
+        registro_previo = None if forzar else obtener_periodo(manifest_path, dataset, periodo)
         etag_previo = registro_previo.etag if registro_previo else None
 
         scratch_periodo = scratch_dir / f"{dataset}_{anio}_{mes}"
