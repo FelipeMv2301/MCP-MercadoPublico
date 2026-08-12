@@ -8,9 +8,11 @@ documentada de cancelar una consulta DuckDB en curso desde otro hilo.
 
 Endpoint público sobre un lake de decenas de millones de filas: el riesgo no
 es confidencialidad (los datos son públicos), es que una consulta sin acotar
-tumbe el proceso para todos los demás. Ninguna tool expone SQL arbitrario a
-Claude (ver server.py) — esto es la segunda capa, por si un filtro amplio
-(sin producto/organismo) igual termina escaneando de más.
+tumbe el proceso para todos los demás. La mayoría de las tools corren SQL
+fijo (ver server.py) — esto es la segunda capa, por si un filtro amplio
+(sin producto/organismo) igual termina escaneando de más. `consultar_lake`
+(ver lake/consultas_sql.py) SÍ acepta SQL de Claude, pero sólo SELECT/WITH
+sobre vistas fijas — pasa igual por este mismo timeout.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ MAX_PERIODOS_POR_INGESTA = 36  # 3 años — una ingesta más larga se pide en t
 MAX_CRUCES_HEAD_TO_HEAD = 50  # head_to_head() no tenía límite propio (HU-7.2)
 LIMITE_MAXIMO_HEAD_TO_HEAD = 200  # tope duro del parámetro `limite` — evita que
 # un cliente pida una página gigante y vuelva a inundar el contexto del LLM.
+LIMITE_MAXIMO_CONSULTA_SQL = 500  # tope duro de filas por página de consultar_lake.
 
 P = ParamSpec("P")
 R = TypeVar("R")

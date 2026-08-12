@@ -24,6 +24,7 @@ from mcp_mercadopublico import catalogo, inteligencia, precios, sheets
 from mcp_mercadopublico.auth import AutenticacionBearerMiddleware
 from mcp_mercadopublico.config import get_settings
 from mcp_mercadopublico.formato.tsv_xml import filas_a_tsv_xml
+from mcp_mercadopublico.lake import consultas_sql
 from mcp_mercadopublico.lake.etl import ingerir_periodo
 from mcp_mercadopublico import limites
 from mcp_mercadopublico.scheduler import lifespan_con_ingesta_periodica
@@ -704,6 +705,63 @@ def leer_sheets(nombre_hoja: str) -> dict:
         return {"error": f"No se pudo leer Sheets: {exc}"}
 
     return {"hoja": nombre_hoja, "n_filas": len(filas), "filas": filas}
+
+
+@mcp.tool()
+def consultar_lake(sql: str, offset: int = 0, limite: int = 100) -> dict:
+    """Consulta SQL de sólo lectura sobre el data lake completo — para
+    análisis ad hoc que las tools fijas (head_to_head, benchmark_precio,
+    etc.) no cubren.
+
+    SÓLO SELECT/WITH sobre 3 vistas fijas: `oc` (órdenes de compra),
+    `lic` (licitaciones), `cot` (cotizaciones de compra ágil) — un dataset
+    sin datos ingeridos todavía simplemente no aparece en
+    `datasets_disponibles` y no se puede usar en FROM. Nombres de columna
+    en snake_case (ej. `monto_total`, `rut_proveedor`), no los originales
+    de ChileCompra. Cualquier otro comando (ATTACH, COPY, INSTALL, CREATE,
+    INSERT, DROP, etc.) se rechaza antes de ejecutar nada — es de sólo
+    lectura.
+
+    PAGINADO igual que head_to_head: `filas` viene acotado a `limite`
+    (tope duro: ver límite real en el error si pides de más). Si `hay_mas`
+    es true, repetir con offset += limite para traer el resto. No hay
+    `total_filas` — calcularlo sobre una query arbitraria costaría tanto
+    como la query misma; usa `hay_mas` para saber cuándo detenerte.
+
+    Toda consulta tiene un plazo máximo — una query sin acotar (sin WHERE
+    sobre un lake de millones de filas) se interrumpe con error en vez de
+    colgar el servidor para el resto de los usuarios.
+
+    Args:
+        sql: un único SELECT (o WITH ... SELECT) sobre oc/lic/cot.
+        offset: cuántas filas saltar desde el inicio (para paginar).
+        limite: cuántas filas devolver como máximo.
+    """
+    if offset < 0:
+        return {"error": "offset debe ser >= 0."}
+    if limite <= 0:
+        return {"error": "limite debe ser > 0."}
+    limite = min(limite, limites.LIMITE_MAXIMO_CONSULTA_SQL)
+
+    settings = get_settings()
+    try:
+        filas, hay_mas, disponibles = limites.consultar(
+            consultas_sql.ejecutar_consulta,
+            settings.data_dir, sql, offset, limite,
+        )
+    except consultas_sql.ConsultaSqlInvalida as exc:
+        return {"error": str(exc)}
+    except limites.ConsultaExcedioTiempoLimite as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Error en la consulta SQL: {exc}"}
+
+    return {
+        "filas": filas,
+        "n_filas": len(filas),
+        "hay_mas": hay_mas,
+        "datasets_disponibles": disponibles,
+    }
 
 
 def _resolver_para_precio(producto: str, settings) -> dict:
