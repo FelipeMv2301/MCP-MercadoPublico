@@ -295,8 +295,12 @@ def _descartar_filas_moneda_no_reconocida(
         return relacion
 
     ident = _escapar_identificador(moneda_col)
-    lista_sql = ", ".join(f"'{v}'" for v in VALORES_MONEDA_VALIDOS[dataset])
-    condicion_valida = f"{ident} IS NULL OR {ident} IN ({lista_sql})"
+    # UPPER(TRIM(...)) — mismo criterio que usa es_clp en _construir_proyeccion.
+    # Sin esto, un valor legítimo con distinto casing/espacios ("PESO CHILENO",
+    # "Peso Chileno ") pasaría el chequeo de es_clp pero se descartaría acá
+    # como "corrupto", perdiendo filas válidas en vez de sólo mal-clasificarlas.
+    lista_sql = ", ".join(f"UPPER('{v}')" for v in VALORES_MONEDA_VALIDOS[dataset])
+    condicion_valida = f"{ident} IS NULL OR UPPER(TRIM({ident})) IN ({lista_sql})"
 
     total = con.execute("SELECT COUNT(*) FROM relacion").fetchone()[0]
     validas = con.execute(f"SELECT COUNT(*) FROM relacion WHERE {condicion_valida}").fetchone()[0]
@@ -338,9 +342,15 @@ def transformar_y_escribir(
     """Lee los CSV ya extraídos/transcodificados a UTF-8, renombra y tipa
     columnas, filtra y escribe una partición Parquet.
 
-    Devuelve (filas_leidas, filas_escritas, ruta_parquet). La diferencia
-    entre ambas es lo descartado por el filtro de rubro/whitelist — nunca
-    se trunca en silencio, el llamador debe loggear ese delta.
+    Devuelve (filas_leidas, filas_escritas, ruta_parquet). `filas_leidas` ya
+    viene neto de lo que _leer_csv descartó por corrupción del camino
+    tolerante (ver _descartar_filas_moneda_no_reconocida) — no aparece en
+    ese log separado. La diferencia entre filas_leidas y filas_escritas es
+    el filtro de rubro/whitelist MÁS la deduplicación de filas 100%
+    idénticas (ver `duplicadas` en el log `filas_duplicadas_descartadas`) —
+    ninguno de los dos se trunca en silencio, pero quedan mezclados en este
+    delta; el llamador que necesite separarlos debe leer los logs, no sólo
+    este número.
     """
     origen = str(rutas_csv[0]) if len(rutas_csv) == 1 else [str(r) for r in rutas_csv]
     rel_origen = _leer_csv(con, origen, rutas_csv, dataset, anio, mes)

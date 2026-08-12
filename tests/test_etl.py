@@ -262,6 +262,26 @@ def test_descartar_filas_moneda_no_reconocida_saca_filas_corruptas(
     assert any("csv_filas_con_moneda_no_reconocida_tras_camino_tolerante" in m for m in mensajes)
 
 
+def test_descartar_filas_moneda_no_reconocida_es_tolerante_a_casing_y_espacios(con):
+    """Mismo criterio que usa es_clp (UPPER(TRIM(...))) — un valor legítimo
+    con distinto casing o espacios no debe tratarse como corrupción, o se
+    perderían filas válidas en vez de sólo mal-clasificarlas."""
+    con.execute(
+        """
+        CREATE TABLE relacion AS SELECT * FROM (VALUES
+            (1, 'PESO CHILENO'),
+            (2, ' Peso Chileno '),
+            (3, 'peso chileno')
+        ) AS v(id, "Moneda de la Oferta")
+        """
+    )
+    relacion = con.table("relacion")
+
+    resultado = etl._descartar_filas_moneda_no_reconocida(con, relacion, "lic", 2026, 3)
+
+    assert con.execute("SELECT COUNT(*) FROM resultado").fetchone()[0] == 3  # ninguna se descarta
+
+
 def test_descartar_filas_moneda_no_reconocida_no_toca_nulos(con):
     """Un valor NULL de moneda es dato faltante, no corrupción — no debe
     descartarse por este chequeo (es un problema distinto, ya cubierto por
