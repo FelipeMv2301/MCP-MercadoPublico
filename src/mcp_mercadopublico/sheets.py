@@ -1,10 +1,17 @@
 """Integración con Google Sheets — reportes de competidores visibles al equipo.
 
-Una pestaña por competidor (licitaciones + sus líneas), nombre decidido por
-quien llama (Claude, siguiendo la instrucción de su tool) — no hay whitelist
-de nombres de pestaña, sólo el spreadsheet destino está fijo (ver
-config.GOOGLE_SHEET_ID_DEFAULT): el modelo elige la pestaña, nunca el
-documento.
+Dos patrones de escritura, según la pestaña:
+- Detalle por competidor (agregar_filas): acumula entre llamadas, nunca pisa
+  lo anterior — para ir agregando licitaciones/líneas a medida que se
+  obtienen.
+- Resumen (reemplazar_filas): reemplaza todo el contenido — para vistas que
+  deben reflejar sólo el estado actual (ej. resumen de competencia), no un
+  historial que crece sin límite.
+
+El nombre de pestaña lo decide quien llama (Claude, siguiendo la instrucción
+de su tool) — no hay whitelist de nombres, sólo el spreadsheet destino está
+fijo (ver config.GOOGLE_SHEET_ID_DEFAULT): el modelo elige la pestaña, nunca
+el documento.
 
 Las funciones reciben el cliente/worksheet ya conectado en vez de armarlo
 adentro, para poder testear la lógica de escritura/lectura con un doble en
@@ -27,6 +34,7 @@ class Worksheet(Protocol):
 
     def get_all_values(self) -> list[list[str]]: ...
     def append_rows(self, valores: list[list[Any]]) -> None: ...
+    def clear(self) -> None: ...
 
 
 def conectar(credenciales: dict):
@@ -72,10 +80,33 @@ def agregar_filas(hoja: Worksheet, filas: list[dict[str, Any]]) -> int:
     encabezado = list(filas[0].keys())
     filas_valores = [[fila.get(col, "") for col in encabezado] for fila in filas]
 
-    hay_encabezado = bool(hoja.get_all_values())
+    # bool(get_all_values()) NO alcanza: bug real verificado contra Sheets
+    # real — una pestaña recién creada (add_worksheet) puede devolver una
+    # lista "no vacía" de filas con celdas vacías (ej. [['', '', '']]), que
+    # bool() trata como "ya tiene encabezado" y lo salta. Se exige al menos
+    # una celda con contenido real.
+    hay_encabezado = any(
+        any(str(celda).strip() for celda in fila) for fila in hoja.get_all_values()
+    )
     lote = filas_valores if hay_encabezado else [encabezado, *filas_valores]
     hoja.append_rows(lote)
 
+    return len(filas)
+
+
+def reemplazar_filas(hoja: Worksheet, filas: list[dict[str, Any]]) -> int:
+    """Reemplaza TODO el contenido de la pestaña por `filas` — a diferencia
+    de agregar_filas (pensada para ir acumulando líneas de un competidor),
+    esto es para vistas "resumen" que deben reflejar sólo el estado actual
+    (ej. Resumen de competencia): correrlo dos veces no debe duplicar ni
+    dejar filas viejas mezcladas con las nuevas."""
+    hoja.clear()
+    if not filas:
+        return 0
+
+    encabezado = list(filas[0].keys())
+    filas_valores = [[fila.get(col, "") for col in encabezado] for fila in filas]
+    hoja.append_rows([encabezado, *filas_valores])
     return len(filas)
 
 

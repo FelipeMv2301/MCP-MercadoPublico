@@ -38,6 +38,9 @@ class HojaFalsa:
         for fila in valores:
             self.filas.append([str(v) for v in fila])
 
+    def clear(self) -> None:
+        self.filas = []
+
 
 @pytest.fixture()
 def settings_sin_sheets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:

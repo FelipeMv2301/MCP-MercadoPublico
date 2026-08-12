@@ -19,6 +19,9 @@ class HojaFalsa:
         for fila in valores:
             self.filas.append([str(v) for v in fila])
 
+    def clear(self) -> None:
+        self.filas = []
+
 
 def test_agregar_filas_en_hoja_vacia_escribe_encabezado_y_datos():
     hoja = HojaFalsa()
@@ -35,6 +38,25 @@ def test_agregar_filas_en_hoja_vacia_escribe_encabezado_y_datos():
         ["P1", "kit", "100"],
         ["P1", "reactivo", "50"],
     ]
+
+
+def test_agregar_filas_en_hoja_recien_creada_con_celdas_vacias_igual_escribe_encabezado():
+    """Bug real verificado contra Google Sheets (2026-08-12): una pestaña
+    recién creada con add_worksheet() puede devolver de get_all_values()
+    filas con celdas vacías (no una lista vacía) — bool() de eso es True,
+    y el encabezado se salteaba en la primera exportación de un competidor
+    nuevo (justo el caso de uso principal)."""
+
+    class HojaReciénCreada(HojaFalsa):
+        def get_all_values(self):
+            return [["", "", ""]] if not self.filas else super().get_all_values()
+
+    hoja = HojaReciénCreada()
+
+    escritas = sheets.agregar_filas(hoja, [{"codigo_proceso": "P1", "monto": 100}])
+
+    assert escritas == 1
+    assert hoja.filas == [["codigo_proceso", "monto"], ["P1", "100"]]
 
 
 def test_agregar_filas_llamada_sucesiva_no_repite_encabezado():
@@ -107,3 +129,46 @@ def test_leer_filas_hoja_con_solo_encabezado_devuelve_lista_vacia():
     hoja.filas.append(["codigo_proceso", "monto"])
 
     assert sheets.leer_filas(hoja) == []
+
+
+# --- reemplazar_filas (pestañas "resumen": snapshot, no historial) --------
+
+
+def test_reemplazar_filas_escribe_encabezado_y_datos():
+    hoja = HojaFalsa()
+
+    escritas = sheets.reemplazar_filas(hoja, [
+        {"competidor": "Rival Uno", "n_cruces": 5},
+        {"competidor": "Rival Dos", "n_cruces": 2},
+    ])
+
+    assert escritas == 2
+    assert hoja.filas == [
+        ["competidor", "n_cruces"],
+        ["Rival Uno", "5"],
+        ["Rival Dos", "2"],
+    ]
+
+
+def test_reemplazar_filas_llamada_sucesiva_no_deja_filas_viejas_mezcladas():
+    """A diferencia de agregar_filas, correr esto dos veces con datos
+    distintos no debe dejar un mix de lo viejo y lo nuevo — es un snapshot."""
+    hoja = HojaFalsa()
+    sheets.reemplazar_filas(hoja, [{"competidor": "Rival Uno", "n_cruces": 5}])
+
+    sheets.reemplazar_filas(hoja, [{"competidor": "Rival Dos", "n_cruces": 9}])
+
+    assert hoja.filas == [
+        ["competidor", "n_cruces"],
+        ["Rival Dos", "9"],
+    ]
+
+
+def test_reemplazar_filas_vacio_deja_la_pestana_limpia():
+    hoja = HojaFalsa()
+    sheets.reemplazar_filas(hoja, [{"competidor": "Rival Uno", "n_cruces": 5}])
+
+    escritas = sheets.reemplazar_filas(hoja, [])
+
+    assert escritas == 0
+    assert hoja.filas == []

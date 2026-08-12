@@ -559,6 +559,31 @@ def radar_competencia(
     }
 
 
+def _resumen_cruces(cruces: list) -> dict:
+    """Estadísticas sobre una lista de CruceHeadToHead — compartido entre
+    head_to_head (un rival) y actualizar_resumen_competencia (todos los de
+    la watchlist), para no calcular esto dos veces distinto."""
+    n_cruces = len(cruces)
+    ganados = sum(1 for c in cruces if c.ganador == "nosotros")
+    diferencias = sorted(c.diferencia_pct for c in cruces if c.diferencia_pct is not None)
+    diferencia_mediana = diferencias[len(diferencias) // 2] if diferencias else None
+
+    advertencia = None
+    if n_cruces == 0:
+        advertencia = "Sin procesos donde ambos hayan participado — no se puede comparar."
+    elif n_cruces < 5:
+        advertencia = (
+            f"Sólo {n_cruces} cruce(s) encontrados: tratar como anécdota, no como patrón."
+        )
+
+    return {
+        "n_cruces": n_cruces,
+        "ganados_por_nosotros": ganados,
+        "diferencia_pct_mediana": diferencia_mediana,
+        "advertencia": advertencia,
+    }
+
+
 @mcp.tool()
 def head_to_head(
     rut_rival: str,
@@ -605,30 +630,14 @@ def head_to_head(
     # devuelta en `cruces` se acota. `inteligencia.head_to_head` ya entrega
     # los cruces en orden estable (canal, codigo_proceso) — el slice de abajo
     # no se solapa ni salta registros entre llamadas con distinto offset.
-    n_cruces = len(cruces)
-    ganados = sum(1 for c in cruces if c.ganador == "nosotros")
-    diferencias = sorted(c.diferencia_pct for c in cruces if c.diferencia_pct is not None)
-    diferencia_mediana = diferencias[len(diferencias) // 2] if diferencias else None
-
-    advertencia = None
-    if n_cruces == 0:
-        advertencia = "Sin procesos donde ambos hayan participado — no se puede comparar."
-    elif n_cruces < 5:
-        advertencia = (
-            f"Sólo {n_cruces} cruce(s) encontrados: tratar como anécdota, no como patrón."
-        )
-
+    resumen = _resumen_cruces(cruces)
+    n_cruces = resumen["n_cruces"]
     cruces_pagina = cruces[offset : offset + limite]
     hay_mas = offset + limite < n_cruces
 
     return {
         "rut_rival": rut_rival,
-        "resumen": {
-            "n_cruces": n_cruces,
-            "ganados_por_nosotros": ganados,
-            "diferencia_pct_mediana": diferencia_mediana,
-            "advertencia": advertencia,
-        },
+        "resumen": resumen,
         "total_cruces": n_cruces,
         "hay_mas": hay_mas,
         "cruces": [
@@ -712,6 +721,95 @@ def leer_sheets(nombre_hoja: str) -> dict:
         return {"error": f"No se pudo leer Sheets: {exc}"}
 
     return {"hoja": nombre_hoja, "n_filas": len(filas), "filas": filas}
+
+
+@mcp.tool()
+def actualizar_resumen_competencia(canal: str | None = None) -> dict:
+    """Corre head_to_head contra cada competidor de la watchlist
+    (config/identidad.toml: competencia.liga_a + liga_b) y escribe una fila
+    por competidor en la pestaña "Resumen" del Sheet — para que el equipo
+    vea de un vistazo contra quién competimos más y a quién le ganamos más,
+    sin scrollear el detalle línea por línea (para eso está
+    exportar_a_sheets).
+
+    A diferencia de exportar_a_sheets (que acumula), esto REEMPLAZA todo el
+    contenido de "Resumen" cada vez — refleja el estado actual, no un
+    historial. Llamar de nuevo para refrescarlo.
+
+    Columnas: competidor, rut, liga (A = alto ticket a hospitales, NO
+    comparable con Bioquimica.cl; B = la competencia real, ver
+    perfil_competidor), n_cruces, ganados_por_nosotros, pct_ganado,
+    diferencia_pct_mediana, nota (advertencia si n_cruces es bajo o cero).
+    Ordenado por n_cruces descendente — los rivales más relevantes primero.
+
+    Args:
+        canal: 'lic', 'cot' o None (ambos) — mismo filtro que head_to_head.
+    """
+    settings = get_settings()
+    if not settings.sheets_habilitado:
+        return {"error": "Google Sheets no está configurado (falta GOOGLE_CREDENTIALS)."}
+
+    competencia = settings.identidad.competencia
+    competidores = (
+        [(c, "A") for c in competencia.liga_a] + [(c, "B") for c in competencia.liga_b]
+    )
+    if not competidores:
+        return {
+            "error": (
+                "No hay competidores en config/identidad.toml "
+                "(competencia.liga_a/liga_b) — nada que resumir."
+            )
+        }
+
+    rut_propio = settings.identidad.nosotros.rut
+    filas = []
+    for competidor, liga in competidores:
+        try:
+            cruces = limites.consultar(
+                inteligencia.head_to_head,
+                settings.data_dir, rut_propio, competidor.rut, canal=canal,
+            )
+            resumen = _resumen_cruces(cruces)
+            nota = resumen["advertencia"] or ""
+        except limites.ConsultaExcedioTiempoLimite as exc:
+            resumen = {"n_cruces": None, "ganados_por_nosotros": None, "diferencia_pct_mediana": None}
+            nota = str(exc)
+
+        pct_ganado = (
+            round(100 * resumen["ganados_por_nosotros"] / resumen["n_cruces"], 1)
+            if resumen["n_cruces"] else None
+        )
+        filas.append(
+            {
+                "competidor": competidor.nombre,
+                "rut": competidor.rut,
+                "liga": liga,
+                "n_cruces": resumen["n_cruces"],
+                "ganados_por_nosotros": resumen["ganados_por_nosotros"],
+                "pct_ganado": pct_ganado,
+                "diferencia_pct_mediana": resumen["diferencia_pct_mediana"],
+                "nota": nota,
+            }
+        )
+
+    filas.sort(key=lambda f: (-(f["n_cruces"] or 0), f["competidor"]))
+
+    try:
+        cliente = sheets.conectar(settings.google_credentials)
+        hoja = sheets.obtener_hoja(cliente, settings.google_sheet_id, "Resumen")
+        filas_escritas = sheets.reemplazar_filas(hoja, filas)
+    except Exception as exc:
+        logger.warning(
+            "sheets_resumen_competencia_fallo",
+            extra={"extra_fields": {"error": str(exc)[:300]}},
+        )
+        return {"error": f"No se pudo escribir el resumen en Sheets: {exc}"}
+
+    return {
+        "hoja": "Resumen",
+        "competidores_procesados": len(filas),
+        "filas_escritas": filas_escritas,
+    }
 
 
 @mcp.tool()
